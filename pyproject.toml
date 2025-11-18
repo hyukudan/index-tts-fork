@@ -28,13 +28,13 @@ dependencies = [
   # and update the lockfile after editing anything below.
   # WARNING: Ensure that you don't have a local `uv.toml` which overrides PyPI
   # while generating the lockfile: https://github.com/astral-sh/uv/issues/15741
-  "accelerate==1.8.1",
+  "accelerate>=1.8.1",  # Updated: >=1.8.1 for better GPU support
   "cn2an==0.5.22",
   "cython==3.0.7",
   "descript-audiotools==0.7.2",
   "einops>=0.8.1",
   "ffmpeg-python==0.2.0",
-  "flash-attn",
+  # flash-attn moved to optional dependencies - see [project.optional-dependencies] below
   "g2p-en==2.1.0",
   "gradio>=5.45.0",
   "jieba==0.42.1",
@@ -45,20 +45,20 @@ dependencies = [
   "modelscope==1.27.0",
   "munch==4.0.0",
   "numba==0.58.1",
-  "numpy==1.26.2",
+  "numpy>=1.26.2,<2.0",  # Updated: allow newer 1.x versions, avoid 2.x for compatibility
   "omegaconf>=2.3.0",
   "opencv-python==4.9.0.80",
   "pandas==2.3.2",
   "pypdf2>=3.0.1",
-  "safetensors==0.5.2",
+  "safetensors>=0.5.2",  # Updated: allow newer versions
   "sentencepiece>=0.2.1",
   "tensorboard==2.9.1",
   "textstat>=0.7.10",
-  "tokenizers==0.21.0",
+  "tokenizers>=0.21.0",  # Updated: allow newer versions
   "torch==2.8.*",
   "torchaudio==2.8.*",
   "tqdm>=4.67.1",
-  "transformers==4.52.1",
+  "transformers>=4.52.1",  # Updated: allow newer versions for better GPU support
   # Use "wetext" on Windows/Mac, otherwise "WeTextProcessing" on Linux.
   "triton-windows<3.5",
   "wetext>=0.0.9; sys_platform != 'linux'",
@@ -73,6 +73,14 @@ webui = [
 # To install the DeepSpeed support, use `uv sync --extra deepspeed` (or `--all-extras`).
 deepspeed = [
   "deepspeed==0.17.1",
+]
+# Flash Attention support - OPTIONAL but recommended for transformer performance
+# For Blackwell GPUs (RTX 6000, etc.), you may need to build from source:
+#   git clone https://github.com/Dao-AILab/flash-attention
+#   cd flash-attention && MAX_JOBS=4 python setup.py install
+# Otherwise, PyPI wheels support up to Ada architecture (sm_90)
+flashattn = [
+  "flash-attn>=2.8.0; sys_platform == 'linux'",
 ]
 cu128 = [
   "torch>=2.7.1",
@@ -117,7 +125,9 @@ torchaudio = [
 torchvision = [
   { index = "pytorch-cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'", extra = "cu128" },
 ]
-flash-attn = { path = "flash_attn-2.8.3+cu128torch2.8.0cxx11abiFALSE-cp310-cp310-win_amd64.whl" }
+# flash-attn hardcoded wheel REMOVED - incompatible with Blackwell and Linux
+# Install flash-attn with: uv sync --extra flashattn
+# For Blackwell GPUs, build from source (see [project.optional-dependencies] comments)
 
 
 [[tool.uv.index]]
