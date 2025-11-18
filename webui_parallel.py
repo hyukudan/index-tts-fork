@@ -87,6 +87,40 @@ os.makedirs(os.path.join(current_dir, "prompts"), exist_ok=True)
 # Avoid DeepSpeed initialization on platforms where it stalls by default
 os.environ.setdefault("INDEXTTS_USE_DEEPSPEED", "0")
 
+# GPU compatibility check and initialization
+def check_gpu_compatibility():
+    """Check GPU compatibility and print diagnostic information."""
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        cuda_version = torch.version.cuda
+        pytorch_version = torch.__version__
+        logger.info(f"GPU detected: {gpu_name}")
+        logger.info(f"CUDA version: {cuda_version}")
+        logger.info(f"PyTorch version: {pytorch_version}")
+
+        # Check for Blackwell architecture (compute capability 10.0+)
+        compute_capability = torch.cuda.get_device_capability(0)
+        logger.info(f"GPU compute capability: {compute_capability[0]}.{compute_capability[1]}")
+
+        if compute_capability[0] >= 10:
+            logger.info("Blackwell architecture detected - using optimized settings")
+        elif compute_capability[0] >= 8:
+            logger.info("Ampere/Ada architecture detected")
+
+        # Clear CUDA cache before starting
+        torch.cuda.empty_cache()
+    else:
+        logger.info("No GPU detected, running on CPU")
+
+def cleanup_gpu_memory():
+    """Clean up GPU memory to prevent OOM errors."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
+
+check_gpu_compatibility()
+
 example_cases: List[List[Any]] = []
 examples_path = Path(current_dir) / "examples" / "cases.jsonl"
 if examples_path.exists():
@@ -541,6 +575,36 @@ def _worker_loop(job_queue: mp.Queue, result_queue: mp.Queue, config: Dict[str, 
                     "batch_id": job.get("batch_id"),
                 }
             )
+        except RuntimeError as exc:  # pragma: no cover - worker runtime path
+            if "out of memory" in str(exc).lower() or "oom" in str(exc).lower():
+                # Clear CUDA cache on OOM
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                logger.exception("Worker GPU out of memory for row %s", job["row_id"])
+                result_queue.put(
+                    {
+                        "type": "result",
+                        "row_id": job["row_id"],
+                        "status": "Error: GPU OOM - Try reducing parameters or worker count",
+                        "output_path": None,
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "error": f"GPU Out of Memory: {str(exc)}",
+                        "batch_id": job.get("batch_id"),
+                    }
+                )
+            else:
+                logger.exception("Worker generation error")
+                result_queue.put(
+                    {
+                        "type": "result",
+                        "row_id": job["row_id"],
+                        "status": f"Error: {exc}",
+                        "output_path": None,
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "error": str(exc),
+                        "batch_id": job.get("batch_id"),
+                    }
+                )
         except Exception as exc:  # pragma: no cover - worker runtime path
             logger.exception("Worker generation error")
             result_queue.put(
@@ -900,21 +964,35 @@ def create_demo() -> gr.Blocks:
 
             duration_seconds = _normalize_duration_seconds(duration_seconds_value)
 
-            tts.infer(
-                spk_audio_prompt=prompt,
-                text=text,
-                output_path=output_path,
-                emo_audio_prompt=emo_ref_path if emo_mode == 1 else None,
-                emo_alpha=float(emo_weight_value) if emo_mode == 1 else 1.0,
-                emo_vector=emo_vector if emo_mode == 2 else None,
-                use_emo_text=(emo_mode == 3),
-                emo_text=emo_text_value,
-                use_random=emo_random_value,
-                verbose=cmd_args.verbose,
-                max_text_tokens_per_sentence=int(max_text_tokens_per_sentence_value),
-                duration_seconds=duration_seconds,
-                **generation_kwargs,
-            )
+            try:
+                tts.infer(
+                    spk_audio_prompt=prompt,
+                    text=text,
+                    output_path=output_path,
+                    emo_audio_prompt=emo_ref_path if emo_mode == 1 else None,
+                    emo_alpha=float(emo_weight_value) if emo_mode == 1 else 1.0,
+                    emo_vector=emo_vector if emo_mode == 2 else None,
+                    use_emo_text=(emo_mode == 3),
+                    emo_text=emo_text_value,
+                    use_random=emo_random_value,
+                    verbose=cmd_args.verbose,
+                    max_text_tokens_per_sentence=int(max_text_tokens_per_sentence_value),
+                    duration_seconds=duration_seconds,
+                    **generation_kwargs,
+                )
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() or "oom" in str(e).lower():
+                    # Clear CUDA cache on OOM
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gr.Warning(f"GPU out of memory. Try reducing max_mel_tokens, max_text_tokens_per_sentence, or duration. Error: {e}")
+                    return gr.update()
+                else:
+                    gr.Warning(f"Generation error: {e}")
+                    return gr.update()
+            except Exception as e:
+                gr.Warning(f"Unexpected error during generation: {e}")
+                return gr.update()
 
             return gr.update(value=output_path, visible=True)
 
@@ -1264,8 +1342,6 @@ def create_demo() -> gr.Blocks:
 
             duration_seconds = _normalize_duration_seconds(duration_seconds_value)
 
-            duration_seconds = _normalize_duration_seconds(duration_seconds_value)
-
             adv_values = list(advanced_param_values)
             expected_len = len(advanced_params)
             if len(adv_values) < expected_len:
@@ -1337,6 +1413,10 @@ def create_demo() -> gr.Blocks:
                     row_entry["output_path"] = result["output_path"]
 
             final_rows = list(row_map.values())
+
+            # Clean up GPU memory after batch completion
+            cleanup_gpu_memory()
+
             table_update = gr.update(value=build_batch_table_data(final_rows))
             dropdown_update, resolved_id, prompt_update, output_update, text_update, selected_row = prepare_batch_selection(
                 final_rows, resolved_id
