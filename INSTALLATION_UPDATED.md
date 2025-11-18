@@ -68,6 +68,70 @@ uv sync --all-extras
 1. Ignora el error
 2. Sigue las instrucciones de "Opción 2 para Blackwell" arriba
 
+## Configuración de GPU (NUEVO)
+
+### Primera Ejecución - Selección Interactiva
+
+Al ejecutar por primera vez, IndexTTS detectará automáticamente todas las GPUs disponibles y te permitirá elegir cuál usar:
+
+```bash
+python webui.py
+```
+
+**Ejemplo con múltiples GPUs:**
+```
+🚀 IndexTTS GPU Configuration
+==================================================
+📍 Platform: Linux (o WSL2 on Windows)
+
+🎮 Detected 2 GPU(s):
+
+  [0] NVIDIA GeForce RTX 4090
+      Architecture: Ada Lovelace (sm_8.9)
+      Memory: 24.0 GB
+      Suggested workers: 3
+
+  [1] NVIDIA RTX 6000 Ada Generation
+      Architecture: Blackwell (sm_10.0)
+      Memory: 48.0 GB
+      Suggested workers: 6
+      💎 Blackwell GPU detected!
+         • BF16 recommended for stability
+         • Flash Attention: build from source required
+
+⚡ Flash Attention: Not installed
+   Install with: uv sync --extra flashattn
+   ⚠️  Blackwell detected: Build from source required!
+
+🎯 Select GPU to use [0-1]: 1
+
+✅ Configuration saved to: ~/.indextts/gpu_config.json
+   Selected GPU: NVIDIA RTX 6000 Ada Generation
+```
+
+**Tu selección se guarda y no se volverá a preguntar.**
+
+### Forzar GPU Específica
+
+```bash
+# Usar GPU 1 siempre
+python webui.py --gpu 1
+
+# O con webui_parallel
+python webui_parallel.py --gpu 1
+```
+
+### Cambiar GPU Seleccionada
+
+```bash
+# Opción 1: Borrar configuración
+rm ~/.indextts/gpu_config.json
+python webui.py  # Preguntará de nuevo
+
+# Opción 2: Usar argumento --gpu
+python webui.py --gpu 0  # Cambiar a GPU 0
+```
+
 ## Verificación de la Instalación
 
 ### 1. Verificar GPU y Dependencias
@@ -76,18 +140,25 @@ uv sync --all-extras
 python webui.py --verbose
 ```
 
-Deberías ver:
+Después de la configuración interactiva, verás:
 ```
-GPU detected: NVIDIA GeForce RTX 6000...
-CUDA version: 12.8
-PyTorch version: 2.8.x
-GPU Memory: XX.XX GB total
-GPU compute capability: 10.0
-✅ Blackwell architecture detected
-💡 Tip: Blackwell GPUs support BF16...
-✅ Flash Attention available (version: 2.x.x)  # Si instalaste Flash Attention
-⚠️  Flash Attention not found...              # Si no instalaste Flash Attention
-💡 Suggested worker count: X
+📊 IndexTTS Configuration Summary
+==================================================
+Platform: Linux
+
+GPU 1: NVIDIA RTX 6000 Ada Generation
+  • Architecture: Blackwell (sm_10.0)
+  • Memory: 48.0 GB
+  • CUDA: 12.8
+  • PyTorch: 2.8.x
+
+⚡ Flash Attention: v2.x.x  # O "Not installed"
+
+💡 Recommendations:
+  • Suggested parallel workers: 6
+  • Use BF16 for better stability (FP16 may cause NaN)
+  • Build Flash Attention from source for best performance
+==================================================
 ```
 
 ### 2. Verificar Transformers

@@ -26,6 +26,7 @@ parser.add_argument("--port", type=int, default=7860, help="Port to run the web 
 parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the web UI on")
 parser.add_argument("--model_dir", type=str, default="checkpoints", help="Model checkpoints directory")
 parser.add_argument("--is_fp16", action="store_true", default=False, help="Fp16 infer")
+parser.add_argument("--gpu", type=int, default=None, help="GPU device ID to use (for multi-GPU systems)")
 cmd_args = parser.parse_args()
 
 if not os.path.exists(cmd_args.model_dir):
@@ -64,53 +65,8 @@ from modelscope.hub import api
 i18n = I18nAuto(language="Auto")
 MODE = 'local'
 
-# GPU compatibility check and initialization
-def check_gpu_compatibility():
-    """Check GPU compatibility and print diagnostic information."""
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        cuda_version = torch.version.cuda
-        pytorch_version = torch.__version__
-        print(f"GPU detected: {gpu_name}")
-        print(f"CUDA version: {cuda_version}")
-        print(f"PyTorch version: {pytorch_version}")
-
-        # Memory information
-        total_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
-        print(f"GPU Memory: {total_memory:.2f} GB total")
-
-        # Check for Blackwell architecture (compute capability 10.0+)
-        compute_capability = torch.cuda.get_device_capability(0)
-        print(f"GPU compute capability: {compute_capability[0]}.{compute_capability[1]}")
-
-        if compute_capability[0] >= 10:
-            print("✅ Blackwell architecture detected")
-            print("💡 Tip: Blackwell GPUs support BF16 for better stability than FP16")
-            print("💡 Consider using --is_fp16 for faster inference with careful monitoring")
-            # Set optimized CUDA settings for Blackwell
-            os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "0")
-            os.environ.setdefault("TORCH_CUDNN_V8_API_ENABLED", "1")
-        elif compute_capability[0] >= 8:
-            print("✅ Ampere/Ada architecture detected")
-        elif compute_capability[0] >= 7:
-            print("✅ Volta/Turing architecture detected")
-
-        # Check Flash Attention availability
-        try:
-            import flash_attn
-            print(f"✅ Flash Attention available (version: {flash_attn.__version__})")
-        except ImportError:
-            print("⚠️  Flash Attention not found - transformer performance may be reduced")
-            print("   Install with: pip install flash-attn")
-
-        # Suggest optimal worker count for parallel processing
-        suggested_workers = max(1, min(int(total_memory // 8), 8))
-        print(f"💡 Suggested worker count for parallel processing: {suggested_workers}")
-
-        # Clear CUDA cache before starting
-        torch.cuda.empty_cache()
-    else:
-        print("⚠️  No GPU detected, running on CPU")
+# Import GPU configuration system
+from indextts.utils.gpu_config import setup_gpu
 
 def cleanup_gpu_memory():
     """Clean up GPU memory to prevent OOM errors."""
@@ -120,7 +76,13 @@ def cleanup_gpu_memory():
         import gc
         gc.collect()
 
-check_gpu_compatibility()
+# Setup GPU with interactive selection if needed
+gpu_id, gpu_info = setup_gpu(cmd_args.gpu)
+
+# Apply optimizations based on GPU architecture
+if gpu_info.get('is_blackwell'):
+    os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "0")
+    os.environ.setdefault("TORCH_CUDNN_V8_API_ENABLED", "1")
 
 tts = IndexTTS2(
     model_dir=cmd_args.model_dir,

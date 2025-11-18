@@ -174,6 +174,69 @@ python -c "import transformers; print(f'Transformers: {transformers.__version__}
 watch -n 0.5 nvidia-smi
 ```
 
+### Multi-GPU Systems
+
+**NEW**: IndexTTS now supports multi-GPU systems with interactive selection!
+
+#### First Run - Interactive Setup
+
+When you run the application for the first time (or after deleting config):
+
+```bash
+python webui.py
+```
+
+You'll see:
+```
+🚀 IndexTTS GPU Configuration
+==================================================
+📍 Platform: Linux
+
+🎮 Detected 2 GPU(s):
+
+  [0] NVIDIA GeForce RTX 4090
+      Architecture: Ada Lovelace (sm_8.9)
+      Memory: 24.0 GB
+      Suggested workers: 3
+
+  [1] NVIDIA RTX 6000 Ada Generation
+      Architecture: Blackwell (sm_10.0)
+      Memory: 48.0 GB
+      Suggested workers: 6
+      💎 Blackwell GPU detected!
+
+⚡ Flash Attention: Not installed
+   Install with: uv sync --extra flashattn
+   ⚠️  Blackwell detected: Build from source required!
+
+🎯 Select GPU to use [0-1]: _
+```
+
+Your choice is saved to `~/.indextts/gpu_config.json`
+
+#### Forcing a Specific GPU
+
+```bash
+# Always use GPU 1
+python webui.py --gpu 1
+
+# Or webui_parallel
+python webui_parallel.py --gpu 1
+```
+
+#### Changing GPU Selection
+
+To reconfigure:
+```bash
+# Delete saved configuration
+rm ~/.indextts/gpu_config.json
+
+# Next run will prompt again
+python webui.py
+```
+
+Or just use `--gpu` argument to override.
+
 ### Known Issues
 
 1. **Flash Attention wheel not available for Blackwell**
@@ -184,9 +247,10 @@ watch -n 0.5 nvidia-smi
    - May cause errors on some GPUs
    - Disable if needed: Remove `use_torch_compile` flag
 
-3. **Multi-GPU support**
-   - Currently only uses GPU 0
-   - For multi-GPU, modifications needed in `indextts/infer_v2_modded.py`
+3. **WSL vs Windows Native**
+   - WSL2 often provides better performance than Windows native
+   - GPU detection works in both, but WSL2 is recommended
+   - The interactive setup will detect and inform you about WSL
 
 ### Getting Help
 
