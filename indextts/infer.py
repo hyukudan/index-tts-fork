@@ -16,8 +16,7 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-from indextts.BigVGAN.models import BigVGAN as Generator
-from indextts.gpt.model import UnifiedVoice
+from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.utils.checkpoint import load_checkpoint
 from indextts.utils.feature_extractors import MelSpectrogramFeatures
 
@@ -109,15 +108,14 @@ class IndexTTS:
             except:
                 print(">> Failed to load custom CUDA kernel for BigVGAN. Falling back to torch.")
                 self.use_cuda_kernel = False
-        self.bigvgan = Generator(self.cfg.bigvgan, use_cuda_kernel=self.use_cuda_kernel)
-        self.bigvgan_path = os.path.join(self.model_dir, self.cfg.bigvgan_checkpoint)
-        vocoder_dict = torch.load(self.bigvgan_path, map_location="cpu")
-        self.bigvgan.load_state_dict(vocoder_dict["generator"])
+        # Load BigVGAN vocoder from HuggingFace (v2 pattern)
+        from indextts.s2mel.modules.bigvgan import bigvgan
+        bigvgan_name = self.cfg.vocoder.name
+        self.bigvgan = bigvgan.BigVGAN.from_pretrained(bigvgan_name, use_cuda_kernel=self.use_cuda_kernel)
         self.bigvgan = self.bigvgan.to(self.device)
-        # remove weight norm on eval mode
         self.bigvgan.remove_weight_norm()
         self.bigvgan.eval()
-        print(">> bigvgan weights restored from:", self.bigvgan_path)
+        print(">> BigVGAN vocoder loaded from:", bigvgan_name)
         self.bpe_path = os.path.join(self.model_dir, self.cfg.dataset["bpe_model"])
         self.normalizer = TextNormalizer()
         self.normalizer.load()
@@ -400,7 +398,7 @@ class IndexTTS:
                 with torch.amp.autocast(batch_text_tokens.device.type, enabled=self.dtype is not None,
                                         dtype=self.dtype):
                     temp_codes = self.gpt.inference_speech(auto_conditioning, batch_text_tokens,
-                                                           cond_mel_lengths=cond_mel_lengths,
+                                                           cond_lengths=cond_mel_lengths,
                                                            # text_lengths=text_len,
                                                            do_sample=do_sample,
                                                            top_p=top_p,
@@ -591,8 +589,8 @@ class IndexTTS:
             m_start_time = time.perf_counter()
             with torch.no_grad():
                 with torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
-                    codes = self.gpt.inference_speech(auto_conditioning, text_tokens,
-                                                      cond_mel_lengths=torch.tensor([auto_conditioning.shape[-1]],
+                    codes, _ = self.gpt.inference_speech(auto_conditioning, text_tokens,
+                                                      cond_lengths=torch.tensor([auto_conditioning.shape[-1]],
                                                                                     device=text_tokens.device),
                                                       # text_lengths=text_len,
                                                       do_sample=do_sample,

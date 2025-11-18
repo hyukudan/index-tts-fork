@@ -4,10 +4,10 @@ dataset:
     squeeze: false
     mel:
         sample_rate: 24000
-        n_fft: 1024
+        n_fft: 2048
         hop_length: 256
-        win_length: 1024
-        n_mels: 100
+        win_length: 2048
+        n_mels: 1024
         mel_fmin: 0
         normalize: false
 

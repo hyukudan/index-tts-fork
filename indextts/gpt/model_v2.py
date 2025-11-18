@@ -554,7 +554,7 @@ class UnifiedVoice(nn.Module):
             speech_conditioning_input = self.conditioning_encoder(speech_conditioning_input)  # (b, d, s)
             conds = self.perceiver_encoder(speech_conditioning_input.transpose(1, 2))  # (b, 32, d)
         elif self.condition_type == "conformer_perceiver":
-            speech_conditioning_input, mask = self.conditioning_encoder(speech_conditioning_input.transpose(1, 2),
+            speech_conditioning_input, mask = self.conditioning_encoder(speech_conditioning_input,
                                                                         cond_mel_lengths)  # (b, s, d), (b, 1, s)
             if self.condition_type == "conformer_perceiver":
                 # conds_mask = torch.cat([torch.ones((mask.shape[0], self.cond_num), dtype=torch.bool), mask.squeeze(1)], dim=1)
@@ -588,7 +588,7 @@ class UnifiedVoice(nn.Module):
         return self.mel_pos_embedding.emb(clamped)
 
     def get_emo_conditioning(self, speech_conditioning_input, cond_mel_lengths=None):
-        speech_conditioning_input, mask = self.emo_conditioning_encoder(speech_conditioning_input.transpose(1, 2),
+        speech_conditioning_input, mask = self.emo_conditioning_encoder(speech_conditioning_input,
                                                                         cond_mel_lengths)  # (b, s, d), (b, 1, s)
         conds_mask = self.emo_cond_mask_pad(mask.squeeze(1))
         conds = self.emo_perceiver_encoder(speech_conditioning_input, conds_mask)  # (b, 1, d)
