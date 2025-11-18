@@ -35,6 +35,10 @@ from transformers import SeamlessM4TFeatureExtractor
 import random
 import torch.nn.functional as F
 
+# Memory management constants
+MAX_CACHE_SIZE_MB = 2048  # Maximum cache size in MB before eviction
+CACHE_CHECK_INTERVAL = 5  # Check cache size every N inferences
+
 class IndexTTS2:
     @staticmethod
     def _load_gpt_state_dict(path: str) -> dict:
@@ -312,6 +316,83 @@ class IndexTTS2:
         self.gr_progress = None
         self.model_version = self.cfg.version if hasattr(self.cfg, "version") else None
 
+        # Cache management tracking
+        self._inference_counter = 0
+
+        # Performance telemetry
+        self.last_gpt_time = 0.0
+        self.last_s2mel_time = 0.0
+        self.last_bigvgan_time = 0.0
+        self.last_total_time = 0.0
+        self.last_audio_duration = 0.0
+        self.last_rtf = 0.0
+
+    def _get_cache_memory_mb(self) -> float:
+        """
+        Calculate approximate memory usage of cached tensors in MB.
+
+        Returns:
+            float: Memory usage in MB
+        """
+        if not torch.cuda.is_available():
+            return 0.0
+
+        total_bytes = 0
+        cache_items = [
+            self.cache_spk_cond,
+            self.cache_s2mel_style,
+            self.cache_s2mel_prompt,
+            self.cache_emo_cond,
+            self.cache_mel
+        ]
+
+        for item in cache_items:
+            if item is not None:
+                if isinstance(item, torch.Tensor):
+                    total_bytes += item.element_size() * item.nelement()
+                elif isinstance(item, (list, tuple)):
+                    for tensor in item:
+                        if isinstance(tensor, torch.Tensor):
+                            total_bytes += tensor.element_size() * tensor.nelement()
+
+        return total_bytes / (1024 ** 2)  # Convert to MB
+
+    def _check_and_evict_cache(self):
+        """
+        Check cache size and evict if exceeds MAX_CACHE_SIZE_MB.
+        Called periodically during inference to prevent OOM.
+        """
+        if not torch.cuda.is_available():
+            return
+
+        cache_mb = self._get_cache_memory_mb()
+
+        if cache_mb > MAX_CACHE_SIZE_MB:
+            print(f">> Cache size ({cache_mb:.1f}MB) exceeds limit ({MAX_CACHE_SIZE_MB}MB), clearing...")
+            self._clear_all_caches()
+
+            # Force GPU memory cleanup
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
+    def _clear_all_caches(self):
+        """
+        Clear all cached audio prompts and intermediate tensors.
+        Useful for memory management or switching reference audio.
+        """
+        self.cache_spk_cond = None
+        self.cache_s2mel_style = None
+        self.cache_s2mel_prompt = None
+        self.cache_spk_audio_prompt = None
+        self.cache_emo_cond = None
+        self.cache_emo_audio_prompt = None
+        self.cache_mel = None
+
+        # Collect garbage to help Python reclaim memory
+        import gc
+        gc.collect()
+
     @torch.no_grad()
     def get_emb(self, input_features, attention_mask):
         vq_emb = self.semantic_model(
@@ -416,6 +497,12 @@ class IndexTTS2:
               verbose=False, max_text_tokens_per_sentence=120, **generation_kwargs):
         print(">> start inference...")
         self._set_gr_progress(0, "start inference...")
+
+        # Periodically check cache size to prevent OOM
+        self._inference_counter += 1
+        if self._inference_counter % CACHE_CHECK_INTERVAL == 0:
+            self._check_and_evict_cache()
+
         if verbose:
             print(f"origin text:{text}, spk_audio_prompt:{spk_audio_prompt},"
                   f" emo_audio_prompt:{emo_audio_prompt}, emo_alpha:{emo_alpha}, "
@@ -751,13 +838,22 @@ class IndexTTS2:
         wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
         wav = torch.cat(wavs, dim=1)
         wav_length = wav.shape[-1] / sampling_rate
+
+        # Store telemetry data in instance variables for monitoring/UI display
+        self.last_gpt_time = gpt_gen_time + gpt_forward_time
+        self.last_s2mel_time = s2mel_time
+        self.last_bigvgan_time = bigvgan_time
+        self.last_total_time = end_time - start_time
+        self.last_audio_duration = wav_length
+        self.last_rtf = (end_time - start_time) / wav_length if wav_length > 0 else 0.0
+
         print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
         print(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
         print(f">> s2mel_time: {s2mel_time:.2f} seconds")
         print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
-        print(f">> Total inference time: {end_time - start_time:.2f} seconds")
-        print(f">> Generated audio length: {wav_length:.2f} seconds")
-        print(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
+        print(f">> Total inference time: {self.last_total_time:.2f} seconds")
+        print(f">> Generated audio length: {self.last_audio_duration:.2f} seconds")
+        print(f">> RTF: {self.last_rtf:.4f}")
 
         # save audio
         wav = wav.cpu()  # to cpu
