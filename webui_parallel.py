@@ -89,7 +89,10 @@ os.makedirs(os.path.join(current_dir, "prompts"), exist_ok=True)
 os.environ.setdefault("INDEXTTS_USE_DEEPSPEED", "0")
 
 # Import GPU configuration system
-from indextts.utils.gpu_config import setup_gpu
+from indextts.utils.gpu_config import setup_gpu, GPUConfig
+from indextts.utils.resource_monitor import get_monitor, format_vram_bar
+from indextts.utils.model_metadata import get_gpt_info, get_tokenizer_info, format_model_display, format_tokenizer_display
+from indextts.utils.audio_history import get_history_manager
 
 def cleanup_gpu_memory():
     """Clean up GPU memory to prevent OOM errors."""
@@ -248,6 +251,100 @@ def _shutdown_worker_pool():
 
 
 atexit.register(_shutdown_worker_pool)
+
+# GPU management functions
+_gpu_config_manager = GPUConfig()
+_current_gpu_id = gpu_id
+
+
+def get_available_gpus() -> list[tuple[str, int]]:
+    """Get list of available GPUs as (label, device_id) tuples."""
+    gpus = _gpu_config_manager.detect_gpus()
+    gpu_list = []
+    for gpu in gpus:
+        label = f"GPU {gpu['id']}: {gpu['name']} ({gpu['memory_gb']:.1f} GB)"
+        gpu_list.append((label, gpu['id']))
+    return gpu_list
+
+
+def switch_gpu_device(gpu_id: int, gpt_label: str, bpe_label: str, gpt_map: dict, bpe_map: dict) -> tuple:
+    """
+    Switch to a different GPU and reload models.
+
+    Args:
+        gpu_id: Target GPU device ID
+        gpt_label: Current GPT model label
+        bpe_label: Current BPE model label
+        gpt_map: Mapping of labels to GPT paths
+        bpe_map: Mapping of labels to BPE paths
+
+    Returns:
+        Tuple of (status_message, model_status)
+    """
+    global _current_gpu_id
+
+    if gpu_id == _current_gpu_id:
+        return "Already using this GPU.", _model_status_text()
+
+    try:
+        # Get current model paths
+        gpt_path = gpt_map.get(gpt_label, gpt_label) if gpt_label else None
+        bpe_path = bpe_map.get(bpe_label, bpe_label) if bpe_label else None
+
+        # Dispose current models
+        dispose_primary_tts()
+        worker_pool.stop()
+        cleanup_gpu_memory()
+
+        # Set new GPU device
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        _current_gpu_id = gpu_id
+
+        # Reload models if they were loaded
+        if gpt_path and bpe_path:
+            # Force PyTorch to reinitialize CUDA
+            if torch.cuda.is_available():
+                torch.cuda.init()
+
+            load_primary_tts(gpt_path, bpe_path)
+            message = f"✅ Switched to GPU {gpu_id} and reloaded models."
+        else:
+            message = f"✅ Switched to GPU {gpu_id}. Load models to use them."
+
+        return message, _model_status_text()
+
+    except Exception as exc:
+        logger.exception("Failed to switch GPU")
+        return f"❌ Failed to switch GPU: {exc}", _model_status_text()
+
+
+def get_gpu_monitor_text() -> str:
+    """Get formatted GPU monitoring information."""
+    monitor = get_monitor()
+    stats = monitor.get_gpu_stats(_current_gpu_id)
+
+    if not stats:
+        return "⚠️ GPU monitoring unavailable"
+
+    lines = [
+        f"**GPU {stats.device_id}: {stats.name}**",
+        f"VRAM: {stats.memory_used}MB / {stats.memory_total}MB",
+        format_vram_bar(stats.memory_percent, width=30),
+    ]
+
+    if stats.temperature is not None:
+        temp_emoji = "🌡️" if stats.temperature < 80 else "🔥"
+        lines.append(f"{temp_emoji} Temperature: {stats.temperature}°C")
+
+    if stats.utilization is not None:
+        lines.append(f"⚡ Utilization: {stats.utilization}%")
+
+    # OOM risk prediction
+    risk = monitor.predict_oom_risk(_current_gpu_id)
+    if risk == "high" or risk == "critical":
+        lines.append(f"⚠️ OOM Risk: {risk.upper()}")
+
+    return "\n".join(lines)
 
 _PRIMARY_TTS: Optional[IndexTTS2] = None
 _MODEL_SELECTION: Dict[str, Optional[str]] = {"gpt": None, "bpe": None}
@@ -643,6 +740,29 @@ def create_demo() -> gr.Blocks:
         model_status = gr.Markdown(value=_model_status_text())
         gpt_map_state = gr.State(gpt_map)
         bpe_map_state = gr.State(bpe_map)
+
+        # GPU selection and monitoring
+        with gr.Accordion("GPU Configuration & Monitoring", open=True):
+            with gr.Row():
+                # GPU selector
+                available_gpus = get_available_gpus()
+                gpu_labels = [label for label, _ in available_gpus]
+                gpu_ids = [gpu_id for _, gpu_id in available_gpus]
+                current_gpu_label = gpu_labels[gpu_ids.index(_current_gpu_id)] if _current_gpu_id in gpu_ids else (gpu_labels[0] if gpu_labels else None)
+
+                gpu_selector = gr.Dropdown(
+                    choices=gpu_labels,
+                    value=current_gpu_label,
+                    label="Select GPU Device",
+                    interactive=True,
+                    scale=2
+                )
+                apply_gpu_button = gr.Button("Switch GPU", variant="secondary", scale=1)
+
+            with gr.Row():
+                gpu_monitor_display = gr.Markdown(value=get_gpu_monitor_text())
+                refresh_monitor_button = gr.Button("Refresh Monitor", variant="secondary", size="sm")
+
         with gr.Row():
             gpt_dropdown = gr.Dropdown(
                 choices=gpt_labels,
@@ -696,6 +816,42 @@ def create_demo() -> gr.Blocks:
             gr.Info("Models loaded successfully.")
             return _model_status_text()
 
+        def handle_gpu_switch(
+            gpu_label: str,
+            gpt_label: Optional[str],
+            bpe_label: Optional[str],
+            gpt_map_value: Optional[Dict[str, str]],
+            bpe_map_value: Optional[Dict[str, str]],
+        ) -> tuple:
+            """Handle GPU switch button click."""
+            if not gpu_label:
+                gr.Warning("Select a GPU device first.")
+                return get_gpu_monitor_text(), model_status.value
+
+            # Extract GPU ID from label
+            available_gpus = get_available_gpus()
+            gpu_dict = {label: gpu_id for label, gpu_id in available_gpus}
+            target_gpu_id = gpu_dict.get(gpu_label)
+
+            if target_gpu_id is None:
+                gr.Warning("Invalid GPU selection.")
+                return get_gpu_monitor_text(), model_status.value
+
+            message, new_model_status = switch_gpu_device(
+                target_gpu_id,
+                gpt_label or "",
+                bpe_label or "",
+                gpt_map_value or {},
+                bpe_map_value or {}
+            )
+
+            gr.Info(message)
+            return get_gpu_monitor_text(), new_model_status
+
+        def handle_monitor_refresh():
+            """Refresh GPU monitoring display."""
+            return get_gpu_monitor_text()
+
         refresh_models_button.click(
             refresh_model_lists,
             inputs=[],
@@ -706,6 +862,19 @@ def create_demo() -> gr.Blocks:
             inputs=[gpt_dropdown, bpe_dropdown, gpt_map_state, bpe_map_state],
             outputs=model_status,
         )
+
+        # GPU selection and monitoring handlers
+        apply_gpu_button.click(
+            handle_gpu_switch,
+            inputs=[gpu_selector, gpt_dropdown, bpe_dropdown, gpt_map_state, bpe_map_state],
+            outputs=[gpu_monitor_display, model_status],
+        )
+        refresh_monitor_button.click(
+            handle_monitor_refresh,
+            inputs=[],
+            outputs=gpu_monitor_display,
+        )
+
         batch_rows_state = gr.State([])
         next_batch_id_state = gr.State(1)
 
@@ -897,6 +1066,65 @@ def create_demo() -> gr.Blocks:
                         delete_entry_button = gr.Button("Delete Selected")
                         clear_entries_button = gr.Button("Clear All")
 
+        with gr.Tab("Generation History"):
+            gr.Markdown("View and manage your generated audio files from this session.")
+            with gr.Row():
+                history_gallery = gr.Gallery(
+                    label="Generated Audio History",
+                    columns=3,
+                    height="auto",
+                    object_fit="contain"
+                )
+            with gr.Row():
+                refresh_history_button = gr.Button("Refresh History", variant="secondary")
+                clear_history_button = gr.Button("Clear All History", variant="stop")
+            history_stats = gr.Markdown(value="No generations yet.")
+
+        with gr.Tab("Model Comparison"):
+            gr.Markdown("Compare two different models side-by-side. Models are loaded sequentially to save VRAM.")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    comparison_prompt_audio = gr.Audio(label="Prompt Audio", sources=["upload", "microphone"], type="filepath")
+                    comparison_text = gr.TextArea(label="Text to Synthesize", placeholder="Enter text for both models")
+                    gr.Markdown("**Model A**")
+                    gpt_a_dropdown = gr.Dropdown(
+                        choices=gpt_labels,
+                        value=initial_gpt_label,
+                        label="GPT Checkpoint A",
+                        interactive=True,
+                    )
+                    bpe_a_dropdown = gr.Dropdown(
+                        choices=bpe_labels,
+                        value=initial_bpe_label,
+                        label="BPE Tokenizer A",
+                        interactive=True,
+                    )
+                    gr.Markdown("**Model B**")
+                    gpt_b_dropdown = gr.Dropdown(
+                        choices=gpt_labels,
+                        value=initial_gpt_label,
+                        label="GPT Checkpoint B",
+                        interactive=True,
+                    )
+                    bpe_b_dropdown = gr.Dropdown(
+                        choices=bpe_labels,
+                        value=initial_bpe_label,
+                        label="BPE Tokenizer B",
+                        interactive=True,
+                    )
+                    generate_comparison_button = gr.Button("Generate Both", variant="primary")
+
+                with gr.Column(scale=1):
+                    gr.Markdown("**Model A Output**")
+                    output_a_audio = gr.Audio(label="Generated Audio A", type="filepath")
+                    model_a_info = gr.Markdown(value="Not generated yet")
+
+                    gr.Markdown("**Model B Output**")
+                    output_b_audio = gr.Audio(label="Generated Audio B", type="filepath")
+                    model_b_info = gr.Markdown(value="Not generated yet")
+
+            comparison_status = gr.Markdown(value="Select models and click 'Generate Both' to compare.")
+
         def gen_single(
             emo_control_method_value,
             prompt,
@@ -979,6 +1207,29 @@ def create_demo() -> gr.Blocks:
             except Exception as e:
                 gr.Warning(f"Unexpected error during generation: {e}")
                 return gr.update()
+
+            # Save to history
+            try:
+                history = get_history_manager()
+                gpt_name = Path(_MODEL_SELECTION.get("gpt", "unknown")).name if _MODEL_SELECTION.get("gpt") else "unknown"
+                bpe_name = Path(_MODEL_SELECTION.get("bpe", "unknown")).name if _MODEL_SELECTION.get("bpe") else "unknown"
+
+                history.add_generation(
+                    audio_path=output_path,
+                    text=text,
+                    model_gpt=gpt_name,
+                    model_tokenizer=bpe_name,
+                    prompt_audio=prompt,
+                    emotion_mode=EMO_CHOICES[emo_mode] if emo_mode < len(EMO_CHOICES) else f"Mode {emo_mode}",
+                    temperature=generation_kwargs.get("temperature", 1.0),
+                    top_p=generation_kwargs.get("top_p", 0.95),
+                    top_k=generation_kwargs.get("top_k", 50),
+                    max_mel_tokens=generation_kwargs.get("max_mel_tokens", 1500),
+                    duration_seconds=duration_seconds,
+                    seed=generation_kwargs.get("seed"),
+                )
+            except Exception as e:
+                logger.warning(f"Failed to save to history: {e}")
 
             return gr.update(value=output_path, visible=True)
 
@@ -1562,6 +1813,126 @@ def create_demo() -> gr.Blocks:
         def update_prompt_audio():
             return gr.update(interactive=True)
 
+        def refresh_history_gallery():
+            """Refresh the history gallery display."""
+            history = get_history_manager()
+            gallery_data = history.get_gallery_data(limit=50)
+            stats = history.get_statistics()
+
+            stats_text = f"""**Session Statistics:**
+- Total Generations: {stats['total_generations']}
+- Total Duration: {stats['total_duration']:.1f}s
+- Average RTF: {stats['avg_rtf']:.3f}
+"""
+            return gallery_data, stats_text
+
+        def clear_history_all():
+            """Clear all history."""
+            history = get_history_manager()
+            history.clear_history()
+            gr.Info("History cleared successfully.")
+            return [], "No generations yet."
+
+        def generate_comparison(
+            prompt_audio,
+            text,
+            gpt_a_label,
+            bpe_a_label,
+            gpt_b_label,
+            bpe_b_label,
+            gpt_map_value,
+            bpe_map_value,
+            progress: gr.Progress = gr.Progress(),
+        ):
+            """Generate audio with two different models for comparison."""
+            if not prompt_audio:
+                gr.Warning("Upload a prompt audio file first.")
+                return None, "No audio", None, "No audio", "Missing prompt audio."
+
+            if not text or not text.strip():
+                gr.Warning("Enter text to synthesize.")
+                return None, "No audio", None, "No audio", "Missing text input."
+
+            # Get model paths
+            gpt_map_local = gpt_map_value or {}
+            bpe_map_local = bpe_map_value or {}
+
+            gpt_a_path = gpt_map_local.get(gpt_a_label, gpt_a_label)
+            bpe_a_path = bpe_map_local.get(bpe_a_label, bpe_a_label)
+            gpt_b_path = gpt_map_local.get(gpt_b_label, gpt_b_label)
+            bpe_b_path = bpe_map_local.get(bpe_b_label, bpe_b_label)
+
+            if not all([gpt_a_path, bpe_a_path, gpt_b_path, bpe_b_path]):
+                gr.Warning("Select both GPT and BPE models for Model A and Model B.")
+                return None, "No audio", None, "No audio", "Missing model selection."
+
+            output_a_path = os.path.join(current_dir, "outputs", f"compare_a_{int(time.time())}.wav")
+            output_b_path = os.path.join(current_dir, "outputs", f"compare_b_{int(time.time())}.wav")
+
+            status_lines = []
+
+            try:
+                # Generate with Model A
+                progress(0.1, desc="Loading Model A...")
+                dispose_primary_tts()
+                cleanup_gpu_memory()
+
+                load_primary_tts(gpt_a_path, bpe_a_path)
+                tts = ensure_primary_tts()
+                tts.gr_progress = progress
+
+                progress(0.2, desc="Generating with Model A...")
+                start_time = time.time()
+                tts.infer(
+                    spk_audio_prompt=prompt_audio,
+                    text=text,
+                    output_path=output_a_path,
+                    verbose=cmd_args.verbose,
+                )
+                a_duration = time.time() - start_time
+                status_lines.append(f"✅ Model A: {Path(gpt_a_path).name} ({a_duration:.2f}s)")
+
+                # Dispose Model A
+                dispose_primary_tts()
+                cleanup_gpu_memory()
+
+                # Generate with Model B
+                progress(0.6, desc="Loading Model B...")
+                load_primary_tts(gpt_b_path, bpe_b_path)
+                tts = ensure_primary_tts()
+                tts.gr_progress = progress
+
+                progress(0.7, desc="Generating with Model B...")
+                start_time = time.time()
+                tts.infer(
+                    spk_audio_prompt=prompt_audio,
+                    text=text,
+                    output_path=output_b_path,
+                    verbose=cmd_args.verbose,
+                )
+                b_duration = time.time() - start_time
+                status_lines.append(f"✅ Model B: {Path(gpt_b_path).name} ({b_duration:.2f}s)")
+
+                progress(1.0, desc="Comparison complete!")
+
+                # Format model info
+                a_info = f"**Model:** {Path(gpt_a_path).stem}\n**Time:** {a_duration:.2f}s\n**Tokenizer:** {Path(bpe_a_path).stem}"
+                b_info = f"**Model:** {Path(gpt_b_path).stem}\n**Time:** {b_duration:.2f}s\n**Tokenizer:** {Path(bpe_b_path).stem}"
+
+                status = "\n".join(status_lines) + "\n\n**Comparison Complete!** Listen to both outputs above."
+
+                return output_a_path, a_info, output_b_path, b_info, status
+
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    cleanup_gpu_memory()
+                    return None, "OOM Error", None, "OOM Error", f"❌ GPU out of memory: {e}"
+                else:
+                    return None, "Error", None, "Error", f"❌ Generation error: {e}"
+            except Exception as e:
+                logger.exception("Comparison generation failed")
+                return None, "Error", None, "Error", f"❌ Unexpected error: {e}"
+
         emo_control_method.select(
             on_method_select,
             inputs=[emo_control_method],
@@ -1693,6 +2064,35 @@ def create_demo() -> gr.Blocks:
             clear_batch_rows,
             inputs=[batch_rows_state, next_batch_id_state],
             outputs=[batch_rows_state, next_batch_id_state, batch_table, selected_entry, batch_prompt_player, batch_output_player, batch_text_input, batch_status],
+        )
+
+        # Generation History tab handlers
+        refresh_history_button.click(
+            refresh_history_gallery,
+            inputs=[],
+            outputs=[history_gallery, history_stats],
+        )
+        clear_history_button.click(
+            clear_history_all,
+            inputs=[],
+            outputs=[history_gallery, history_stats],
+        )
+
+        # Model Comparison tab handler
+        generate_comparison_button.click(
+            generate_comparison,
+            inputs=[
+                comparison_prompt_audio,
+                comparison_text,
+                gpt_a_dropdown,
+                bpe_a_dropdown,
+                gpt_b_dropdown,
+                bpe_b_dropdown,
+                gpt_map_state,
+                bpe_map_state,
+            ],
+            outputs=[output_a_audio, model_a_info, output_b_audio, model_b_info, comparison_status],
+            show_progress=True,
         )
 
     return demo

@@ -65,8 +65,12 @@ from modelscope.hub import api
 i18n = I18nAuto(language="Auto")
 MODE = 'local'
 
-# Import GPU configuration system
-from indextts.utils.gpu_config import setup_gpu
+# Import GPU configuration system and utilities
+from indextts.utils.gpu_config import setup_gpu, GPUConfig
+from indextts.utils.resource_monitor import get_monitor, format_vram_bar
+from indextts.utils.model_metadata import get_gpt_info, get_tokenizer_info
+from indextts.utils.audio_history import get_history_manager
+import gc
 
 def cleanup_gpu_memory():
     """Clean up GPU memory to prevent OOM errors."""
@@ -84,14 +88,143 @@ if gpu_info.get('is_blackwell'):
     os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "0")
     os.environ.setdefault("TORCH_CUDNN_V8_API_ENABLED", "1")
 
-tts = IndexTTS2(
-    model_dir=cmd_args.model_dir,
-    cfg_path=os.path.join(cmd_args.model_dir, "config.yaml"),
-    is_fp16=cmd_args.is_fp16,
-    use_cuda_kernel=False,
-)
+# Dynamic TTS instance management
+_PRIMARY_TTS = None
+_MODEL_SELECTION = {"gpt": None, "bpe": None}
+_gpu_config_manager = GPUConfig()
+_current_gpu_id = gpu_id
 
 logger = logging.getLogger(__name__)
+
+
+def _discover_gpt_checkpoints():
+    """Discover available GPT checkpoints."""
+    bases = [Path(cmd_args.model_dir), Path(current_dir) / "models"]
+    results = []
+    for base in bases:
+        if not base.exists():
+            continue
+        for path in base.glob("*.pth"):
+            name = path.name.lower()
+            # Exclude non-GPT models
+            if any(x in name for x in ("s2mel", "campplus", "bigvgan", "wav2vec", "emo", "spk", "cfm")):
+                continue
+            results.append(str(path.resolve()))
+    results.sort()
+    return results
+
+
+def _discover_bpe_models():
+    """Discover available BPE tokenizer models."""
+    bases = [Path(cmd_args.model_dir), Path(current_dir) / "tokenizers"]
+    results = []
+    for base in bases:
+        if not base.exists():
+            continue
+        for path in base.glob("*.model"):
+            results.append(str(path.resolve()))
+    results.sort()
+    return results
+
+
+def dispose_primary_tts():
+    """Dispose the current TTS instance and free memory."""
+    global _PRIMARY_TTS
+    if _PRIMARY_TTS is not None:
+        try:
+            if hasattr(_PRIMARY_TTS, "gr_progress"):
+                _PRIMARY_TTS.gr_progress = None
+        finally:
+            _PRIMARY_TTS = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+
+def load_primary_tts(gpt_path, bpe_path):
+    """Load TTS with specified model paths."""
+    dispose_primary_tts()
+    resolved_gpt = os.path.abspath(gpt_path)
+    resolved_bpe = os.path.abspath(bpe_path)
+    previous_selection = _MODEL_SELECTION.copy()
+    _MODEL_SELECTION["gpt"] = resolved_gpt
+    _MODEL_SELECTION["bpe"] = resolved_bpe
+
+    try:
+        tts = IndexTTS2(
+            model_dir=cmd_args.model_dir,
+            cfg_path=os.path.join(cmd_args.model_dir, "config.yaml"),
+            is_fp16=cmd_args.is_fp16,
+            use_cuda_kernel=False,
+            gpt_checkpoint_path=resolved_gpt,
+            bpe_model_path=resolved_bpe,
+        )
+    except Exception:
+        _MODEL_SELECTION.update(previous_selection)
+        dispose_primary_tts()
+        raise
+
+    global _PRIMARY_TTS
+    _PRIMARY_TTS = tts
+    return tts
+
+
+def ensure_primary_tts():
+    """Ensure TTS is loaded, raise error if not."""
+    if _PRIMARY_TTS is None:
+        raise RuntimeError("No model loaded. Use the Load button in the UI.")
+    return _PRIMARY_TTS
+
+
+def get_tts():
+    """Get current TTS instance or load default."""
+    global _PRIMARY_TTS
+    if _PRIMARY_TTS is None:
+        # Load default models on first access
+        default_gpt = os.path.join(cmd_args.model_dir, "gpt.pth")
+        default_bpe = os.path.join(cmd_args.model_dir, "bpe.model")
+        if os.path.exists(default_gpt) and os.path.exists(default_bpe):
+            _PRIMARY_TTS = load_primary_tts(default_gpt, default_bpe)
+    return _PRIMARY_TTS
+
+
+# Initialize with default models
+tts = get_tts()
+
+
+def get_available_gpus():
+    """Get list of available GPUs."""
+    gpus = _gpu_config_manager.detect_gpus()
+    return [(f"GPU {gpu['id']}: {gpu['name']} ({gpu['memory_gb']:.1f} GB)", gpu['id']) for gpu in gpus]
+
+
+def get_gpu_monitor_text():
+    """Get formatted GPU monitoring information."""
+    monitor = get_monitor()
+    stats = monitor.get_gpu_stats(_current_gpu_id)
+
+    if not stats:
+        return "⚠️ GPU monitoring unavailable"
+
+    lines = [
+        f"**GPU {stats.device_id}: {stats.name}**",
+        f"VRAM: {stats.memory_used}MB / {stats.memory_total}MB",
+        format_vram_bar(stats.memory_percent, width=30),
+    ]
+
+    if stats.temperature is not None:
+        temp_emoji = "🌡️" if stats.temperature < 80 else "🔥"
+        lines.append(f"{temp_emoji} Temperature: {stats.temperature}°C")
+
+    if stats.utilization is not None:
+        lines.append(f"⚡ Utilization: {stats.utilization}%")
+
+    risk = monitor.predict_oom_risk(_current_gpu_id)
+    if risk in ("high", "critical"):
+        lines.append(f"⚠️ OOM Risk: {risk.upper()}")
+
+    return "\n".join(lines)
+
 
 # 支持的语言列表
 LANGUAGES = {
@@ -145,6 +278,14 @@ def gen_single(emo_control_method,prompt, text,
     output_path = None
     if not output_path:
         output_path = os.path.join("outputs", f"spk_{int(time.time())}.wav")
+
+    # Ensure TTS is loaded
+    try:
+        tts = ensure_primary_tts()
+    except RuntimeError as exc:
+        gr.Warning(str(exc))
+        return gr.update()
+
     # set gradio progress
     tts.gr_progress = progress
     do_sample, top_p, top_k, temperature, \
@@ -200,6 +341,28 @@ def gen_single(emo_control_method,prompt, text,
     except Exception as e:
         gr.Warning(f"Unexpected error during generation: {e}")
         return gr.update()
+
+    # Save to history
+    try:
+        history = get_history_manager()
+        gpt_name = Path(_MODEL_SELECTION.get("gpt", "unknown")).name if _MODEL_SELECTION.get("gpt") else "unknown"
+        bpe_name = Path(_MODEL_SELECTION.get("bpe", "unknown")).name if _MODEL_SELECTION.get("bpe") else "unknown"
+
+        history.add_generation(
+            audio_path=output,
+            text=text,
+            model_gpt=gpt_name,
+            model_tokenizer=bpe_name,
+            prompt_audio=prompt,
+            emotion_mode=EMO_CHOICES[emo_control_method] if emo_control_method < len(EMO_CHOICES) else f"Mode {emo_control_method}",
+            temperature=kwargs.get("temperature", 1.0),
+            top_p=kwargs.get("top_p", 0.95),
+            top_k=kwargs.get("top_k", 50),
+            max_mel_tokens=kwargs.get("max_mel_tokens", 1500),
+        )
+    except Exception as e:
+        logger.warning(f"Failed to save to history: {e}")
+
     return gr.update(value=output,visible=True)
 
 def update_prompt_audio():
@@ -216,6 +379,40 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 <a href='https://arxiv.org/abs/2506.21619'><img src='https://img.shields.io/badge/ArXiv-2506.21619-red'></a>
 </p>
     ''')
+
+    # Model and GPU Configuration
+    with gr.Accordion("Model & GPU Configuration", open=True):
+        # Model selection
+        with gr.Row():
+            gpt_checkpoints = _discover_gpt_checkpoints()
+            bpe_models = _discover_bpe_models()
+
+            gpt_dropdown = gr.Dropdown(
+                choices=[Path(p).name for p in gpt_checkpoints],
+                value=Path(gpt_checkpoints[0]).name if gpt_checkpoints else None,
+                label="GPT Checkpoint (.pth)",
+                interactive=True,
+                scale=2
+            )
+            bpe_dropdown = gr.Dropdown(
+                choices=[Path(p).name for p in bpe_models],
+                value=Path(bpe_models[0]).name if bpe_models else None,
+                label="BPE Tokenizer (.model)",
+                interactive=True,
+                scale=2
+            )
+            load_models_button = gr.Button("Load Models", variant="primary", scale=1)
+
+        model_status = gr.Markdown(value="✅ Default models loaded" if tts else "⚠️ No models loaded")
+
+        # GPU monitoring
+        with gr.Row():
+            gpu_monitor_display = gr.Markdown(value=get_gpu_monitor_text())
+            refresh_monitor_button = gr.Button("Refresh GPU Stats", variant="secondary", size="sm")
+
+        # State for model paths
+        gpt_paths_state = gr.State(gpt_checkpoints)
+        bpe_paths_state = gr.State(bpe_models)
 
     with gr.Accordion("Emotion Settings", open=True):
         with gr.Row():
@@ -352,19 +549,81 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                         delete_entry_button = gr.Button("Delete Selected")
                         clear_entries_button = gr.Button("Clear All")
 
+        with gr.Tab("Generation History"):
+            gr.Markdown("View and manage your generated audio files from this session.")
+            with gr.Row():
+                history_gallery = gr.Gallery(
+                    label="Generated Audio History",
+                    columns=3,
+                    height="auto",
+                    object_fit="contain"
+                )
+            with gr.Row():
+                refresh_history_button = gr.Button("Refresh History", variant="secondary")
+                clear_history_button = gr.Button("Clear All History", variant="stop")
+            history_stats = gr.Markdown(value="No generations yet.")
+
+    # Handler functions
+    def handle_model_load(gpt_label, bpe_label, gpt_paths, bpe_paths):
+        """Load selected models."""
+        gpt_path = next((p for p in gpt_paths if Path(p).name == gpt_label), None)
+        bpe_path = next((p for p in bpe_paths if Path(p).name == bpe_label), None)
+
+        if not gpt_path or not bpe_path:
+            gr.Warning("Select both GPT and BPE models.")
+            return "⚠️ Invalid selection"
+
+        try:
+            load_primary_tts(gpt_path, bpe_path)
+            gr.Info("Models loaded successfully!")
+            return f"✅ Loaded: **{gpt_label}** | **{bpe_label}**"
+        except Exception as e:
+            logger.exception("Failed to load models")
+            gr.Warning(f"Failed to load models: {e}")
+            return f"❌ Load failed: {e}"
+
+    def refresh_monitor():
+        """Refresh GPU monitor."""
+        return get_gpu_monitor_text()
+
+    def refresh_history_gallery():
+        """Refresh history gallery."""
+        history = get_history_manager()
+        gallery_data = history.get_gallery_data(limit=50)
+        stats = history.get_statistics()
+        stats_text = f"""**Session Statistics:**
+- Total Generations: {stats['total_generations']}
+- Total Duration: {stats['total_duration']:.1f}s
+- Average RTF: {stats['avg_rtf']:.3f}
+"""
+        return gallery_data, stats_text
+
+    def clear_history_all():
+        """Clear all history."""
+        history = get_history_manager()
+        history.clear_history()
+        gr.Info("History cleared successfully.")
+        return [], "No generations yet."
+
     def on_input_text_change(text, max_tokens_per_sentence):
         if text and len(text) > 0:
-            text_tokens_list = tts.tokenizer.tokenize(text)
+            try:
+                current_tts = ensure_primary_tts()
+                text_tokens_list = current_tts.tokenizer.tokenize(text)
 
-            sentences = tts.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment=int(max_tokens_per_sentence))
-            data = []
-            for i, s in enumerate(sentences):
-                sentence_str = ''.join(s)
-                tokens_count = len(s)
-                data.append([i, sentence_str, tokens_count])
-            return {
-                sentences_preview: gr.update(value=data, visible=True, type="array"),
-            }
+                sentences = current_tts.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment=int(max_tokens_per_sentence))
+                data = []
+                for i, s in enumerate(sentences):
+                    sentence_str = ''.join(s)
+                    tokens_count = len(s)
+                    data.append([i, sentence_str, tokens_count])
+                return {
+                    sentences_preview: gr.update(value=data, visible=True, type="array"),
+                }
+            except RuntimeError:
+                return {
+                    sentences_preview: gr.update(value=[], visible=True, type="array"),
+                }
         else:
             return {
                 sentences_preview: gr.update(value=[], visible=True, type="array"),
@@ -976,6 +1235,32 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         clear_batch_rows,
         inputs=[batch_rows_state, next_batch_id_state],
         outputs=[batch_rows_state, next_batch_id_state, batch_table, selected_entry, batch_prompt_player, batch_output_player, batch_text_input, batch_status]
+    )
+
+    # Model and GPU configuration handlers
+    load_models_button.click(
+        handle_model_load,
+        inputs=[gpt_dropdown, bpe_dropdown, gpt_paths_state, bpe_paths_state],
+        outputs=model_status
+    )
+
+    refresh_monitor_button.click(
+        refresh_monitor,
+        inputs=[],
+        outputs=gpu_monitor_display
+    )
+
+    # History handlers
+    refresh_history_button.click(
+        refresh_history_gallery,
+        inputs=[],
+        outputs=[history_gallery, history_stats]
+    )
+
+    clear_history_button.click(
+        clear_history_all,
+        inputs=[],
+        outputs=[history_gallery, history_stats]
     )
 
 
