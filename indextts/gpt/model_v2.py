@@ -740,10 +740,10 @@ class UnifiedVoice(nn.Module):
         if emo_cond_lengths is None:
             emo_cond_lengths = torch.tensor([emo_speech_condition.shape[-1]], device=speech_condition.device) 
 
-        speech_conditioning_latent = self.get_conditioning(speech_condition.transpose(1,2), cond_lengths)
+        speech_conditioning_latent = self.get_conditioning(speech_condition, cond_lengths)
         if emo_vec is None:
             print('compute emo vec')
-            emo_vec = self.get_emo_conditioning(emo_speech_condition.transpose(1,2), emo_cond_lengths)
+            emo_vec = self.get_emo_conditioning(emo_speech_condition, emo_cond_lengths)
             emo_vec = self.emovec_layer(emo_vec)
             emo_vec = self.emo_layer(emo_vec)
         else:
@@ -816,7 +816,7 @@ class UnifiedVoice(nn.Module):
         return output, speech_conditioning_latent
 
     def get_emovec(self, emo_speech_conditioning_latent, emo_cond_lengths):
-        emo_vec_syn_ori = self.get_emo_conditioning(emo_speech_conditioning_latent.transpose(1,2), emo_cond_lengths)
+        emo_vec_syn_ori = self.get_emo_conditioning(emo_speech_conditioning_latent, emo_cond_lengths)
         emo_vec_syn = self.emovec_layer(emo_vec_syn_ori)
         emo_vec = self.emo_layer(emo_vec_syn)
         return emo_vec
