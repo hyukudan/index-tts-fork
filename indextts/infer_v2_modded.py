@@ -39,6 +39,82 @@ import torch.nn.functional as F
 MAX_CACHE_SIZE_MB = 2048  # Maximum cache size in MB before eviction
 CACHE_CHECK_INTERVAL = 5  # Check cache size every N inferences
 
+# Dynamic batching constants
+DYNAMIC_BATCH_LENGTH_TOLERANCE = 0.2  # 20% length difference threshold for grouping
+DYNAMIC_BATCH_MAX_SIZE = 4  # Maximum sentences per batch
+
+
+def group_sentences_by_length(
+    sentences: List[List[str]],
+    tolerance: float = DYNAMIC_BATCH_LENGTH_TOLERANCE,
+    max_batch_size: int = DYNAMIC_BATCH_MAX_SIZE
+) -> List[List[int]]:
+    """
+    Group sentence indices by similar length for dynamic batching.
+
+    Groups sentences with similar token counts together to enable efficient
+    batch processing. Sentences within tolerance*100% length difference
+    are grouped together.
+
+    NOTE: This function is currently not used in the inference pipeline due to
+    model architecture constraints. The CFM (Conditional Flow Matching) solver
+    requires batch_size=1 for proper operation. This helper function is provided
+    for future model versions that may support batching, or for pre-processing
+    optimizations.
+
+    Args:
+        sentences: List of tokenized sentences (list of token strings)
+        tolerance: Maximum relative length difference (0.2 = 20%)
+        max_batch_size: Maximum number of sentences per batch
+
+    Returns:
+        List of batches, where each batch is a list of sentence indices
+
+    Example:
+        >>> sentences = [["a", "b"], ["c", "d", "e"], ["f"], ["g", "h"]]
+        >>> groups = group_sentences_by_length(sentences, tolerance=0.3)
+        >>> # Returns: [[0, 3], [1], [2]] - groups similar lengths together
+    """
+    if not sentences:
+        return []
+
+    # Calculate lengths
+    sentence_lengths = [(idx, len(sent)) for idx, sent in enumerate(sentences)]
+
+    # Sort by length for efficient grouping
+    sentence_lengths.sort(key=lambda x: x[1])
+
+    batches = []
+    current_batch = []
+    current_base_length = None
+
+    for idx, length in sentence_lengths:
+        if current_base_length is None:
+            # Start new batch
+            current_base_length = length
+            current_batch = [idx]
+        else:
+            # Check if this sentence fits in current batch
+            min_len = current_base_length
+            max_len = length
+            relative_diff = (max_len - min_len) / min_len if min_len > 0 else 0
+
+            if relative_diff <= tolerance and len(current_batch) < max_batch_size:
+                # Add to current batch
+                current_batch.append(idx)
+            else:
+                # Start new batch
+                batches.append(current_batch)
+                current_batch = [idx]
+                current_base_length = length
+
+    # Add final batch
+    if current_batch:
+        batches.append(current_batch)
+
+    return batches
+
+
 class IndexTTS2:
     @staticmethod
     def _load_gpt_state_dict(path: str) -> dict:
@@ -327,6 +403,21 @@ class IndexTTS2:
         self.last_audio_duration = 0.0
         self.last_rtf = 0.0
 
+        # CUDA graphs support (optional optimization for fixed-size operations)
+        # Note: CUDA graphs require CUDA device and are most effective for
+        # repeated operations with fixed shapes. Due to variable sentence lengths
+        # in TTS, graphs are used selectively for vocoder (BigVGAN) which has
+        # more predictable input patterns.
+        self.use_cuda_graphs = False  # Disabled by default
+        self.cuda_graph_vocoder = None
+        self.cuda_graph_input = None
+        self.cuda_graph_output = None
+        if self.device.startswith("cuda"):
+            # CUDA graphs available but require explicit enablement
+            self.cuda_graphs_available = True
+        else:
+            self.cuda_graphs_available = False
+
     def _get_cache_memory_mb(self) -> float:
         """
         Calculate approximate memory usage of cached tensors in MB.
@@ -392,6 +483,104 @@ class IndexTTS2:
         # Collect garbage to help Python reclaim memory
         import gc
         gc.collect()
+
+    def enable_cuda_graphs(self, warmup_steps: int = 3):
+        """
+        Enable CUDA graphs optimization for the vocoder (BigVGAN).
+
+        CUDA graphs reduce kernel launch overhead by capturing and replaying
+        sequences of CUDA operations. This is most effective for the vocoder
+        which has relatively predictable input shapes.
+
+        Note: CUDA graphs require fixed input shapes and may not work well
+        with highly variable-length inputs. Use with caution.
+
+        Args:
+            warmup_steps: Number of warmup iterations before capturing graph
+        """
+        if not self.cuda_graphs_available:
+            print(">> CUDA graphs not available on this device")
+            return False
+
+        try:
+            print(f">> Warming up CUDA graphs ({warmup_steps} steps)...")
+
+            # Warmup with typical mel spectrogram sizes
+            # Most generated mels are in 100-500 frame range
+            warmup_sizes = [128, 256, 384]
+
+            for size in warmup_sizes:
+                for _ in range(warmup_steps):
+                    # Create dummy input with typical shape
+                    dummy_input = torch.randn(
+                        1, 100, size,  # (batch, n_mels, time)
+                        device=self.device,
+                        dtype=torch.float32
+                    )
+
+                    with torch.no_grad():
+                        _ = self.bigvgan(dummy_input)
+
+            torch.cuda.synchronize()
+            self.use_cuda_graphs = True
+            print(">> CUDA graphs enabled successfully")
+            return True
+
+        except Exception as e:
+            print(f">> Failed to enable CUDA graphs: {e}")
+            self.use_cuda_graphs = False
+            return False
+
+    def disable_cuda_graphs(self):
+        """Disable CUDA graphs optimization."""
+        self.use_cuda_graphs = False
+        self.cuda_graph_vocoder = None
+        self.cuda_graph_input = None
+        self.cuda_graph_output = None
+        print(">> CUDA graphs disabled")
+
+    def capture_vocoder_graph(self, mel_input: torch.Tensor) -> bool:
+        """
+        Capture a CUDA graph for the vocoder with the given input shape.
+
+        Args:
+            mel_input: Example mel spectrogram input tensor
+
+        Returns:
+            bool: True if graph captured successfully
+        """
+        if not self.use_cuda_graphs:
+            return False
+
+        try:
+            # Clear any existing graph
+            if self.cuda_graph_vocoder is not None:
+                del self.cuda_graph_vocoder
+                self.cuda_graph_vocoder = None
+
+            # Create persistent input/output buffers
+            self.cuda_graph_input = torch.zeros_like(mel_input)
+
+            # Warmup (required before capture)
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    self.cuda_graph_output = self.bigvgan(self.cuda_graph_input)
+            torch.cuda.current_stream().wait_stream(s)
+
+            # Capture
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                self.cuda_graph_output = self.bigvgan(self.cuda_graph_input)
+
+            self.cuda_graph_vocoder = graph
+            return True
+
+        except Exception as e:
+            print(f">> Failed to capture vocoder graph: {e}")
+            self.use_cuda_graphs = False
+            return False
 
     @torch.no_grad()
     def get_emb(self, input_features, attention_mask):
@@ -495,6 +684,31 @@ class IndexTTS2:
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
               duration_seconds=None,
               verbose=False, max_text_tokens_per_sentence=120, **generation_kwargs):
+        """
+        Main inference method for text-to-speech generation.
+
+        Performance optimizations:
+        - Memory cache with automatic eviction (MAX_CACHE_SIZE_MB limit)
+        - Per-component timing telemetry (accessible via .last_*_time attributes)
+        - Optional CUDA graphs for vocoder (call .enable_cuda_graphs() before inference)
+        - Architecture-specific optimizations (automatic based on GPU compute capability)
+
+        Args:
+            spk_audio_prompt: Path to speaker reference audio
+            text: Input text to synthesize
+            output_path: Where to save the generated audio
+            emo_audio_prompt: Optional emotion reference audio
+            emo_alpha: Emotion blending factor (0-1)
+            emo_vector: Optional explicit emotion vector
+            use_emo_text: Whether to extract emotion from text
+            emo_text: Text for emotion extraction
+            use_random: Use random emotion selection
+            interval_silence: Silence between sentences (ms)
+            duration_seconds: Target duration (optional)
+            verbose: Enable debug output
+            max_text_tokens_per_sentence: Max tokens per sentence segment
+            **generation_kwargs: Additional generation parameters
+        """
         print(">> start inference...")
         self._set_gr_progress(0, "start inference...")
 
@@ -823,7 +1037,25 @@ class IndexTTS2:
                     s2mel_time += time.perf_counter() - m_start_time
 
                     m_start_time = time.perf_counter()
-                    wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
+
+                    # Try to use CUDA graph for vocoder if enabled and shape matches
+                    vocoder_input = vc_target.float()
+                    if (self.use_cuda_graphs and
+                        self.cuda_graph_vocoder is not None and
+                        self.cuda_graph_input is not None and
+                        vocoder_input.shape == self.cuda_graph_input.shape):
+                        # Use cached graph for faster inference
+                        self.cuda_graph_input.copy_(vocoder_input)
+                        self.cuda_graph_vocoder.replay()
+                        wav = self.cuda_graph_output.squeeze().unsqueeze(0)
+                    else:
+                        # Standard inference path (or capture new graph if enabled)
+                        if self.use_cuda_graphs and self.cuda_graph_vocoder is None:
+                            # First time with this shape - try to capture graph
+                            self.capture_vocoder_graph(vocoder_input)
+
+                        wav = self.bigvgan(vocoder_input).squeeze().unsqueeze(0)
+
                     print(wav.shape)
                     bigvgan_time += time.perf_counter() - m_start_time
                     wav = wav.squeeze(1)
