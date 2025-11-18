@@ -42,23 +42,64 @@ class GPUConfig:
         info = {
             "system": platform.system(),
             "is_wsl": False,
+            "wsl_version": None,
             "is_linux": platform.system() == "Linux",
             "is_windows": platform.system() == "Windows",
             "is_darwin": platform.system() == "Darwin",
             "cuda_available": torch.cuda.is_available(),
         }
 
-        # Detect WSL
+        # Detect WSL and version
         if info["is_linux"]:
             try:
                 with open('/proc/version', 'r') as f:
-                    if 'microsoft' in f.read().lower():
+                    content = f.read().lower()
+                    if 'microsoft' in content or 'wsl' in content:
                         info["is_wsl"] = True
-                        info["wsl_version"] = "WSL2" if "WSL2" in f.read() else "WSL1"
+                        # WSL2 uses different kernel
+                        if 'wsl2' in content or 'microsoft-standard' in content:
+                            info["wsl_version"] = "WSL2"
+                        else:
+                            info["wsl_version"] = "WSL1"
             except:
                 pass
 
         return info
+
+    @staticmethod
+    def check_wsl_gpu_support() -> Dict[str, any]:
+        """Check if WSL has proper GPU support."""
+        result = {
+            "supported": False,
+            "nvidia_smi_works": False,
+            "cuda_available": False,
+            "driver_version": None,
+            "issues": [],
+        }
+
+        # Check if nvidia-smi works
+        try:
+            output = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+                stderr=subprocess.DEVNULL,
+                timeout=5
+            ).decode().strip()
+            result["nvidia_smi_works"] = True
+            result["driver_version"] = output
+        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            result["issues"].append("nvidia-smi not found or not working")
+
+        # Check CUDA availability
+        try:
+            import torch
+            result["cuda_available"] = torch.cuda.is_available()
+            if not result["cuda_available"]:
+                result["issues"].append("CUDA not available in PyTorch")
+        except:
+            result["issues"].append("PyTorch not installed or import failed")
+
+        result["supported"] = result["nvidia_smi_works"] and result["cuda_available"]
+        return result
 
     @staticmethod
     def get_gpu_info() -> List[Dict[str, any]]:
@@ -148,15 +189,45 @@ class GPUConfig:
         print("🚀 IndexTTS GPU Configuration")
         print("="*70)
 
-        # Platform info
+        # Platform info with WSL-specific warnings
         if platform_info["is_wsl"]:
-            print(f"\n📍 Platform: WSL2 on Windows")
-            print("   💡 WSL2 often provides better performance than Windows native")
+            wsl_version = platform_info.get("wsl_version", "Unknown")
+            print(f"\n📍 Platform: {wsl_version}")
+
+            if wsl_version == "WSL1":
+                print("   ❌ WARNING: WSL1 does NOT support GPU!")
+                print("   💡 Please upgrade to WSL2:")
+                print("      wsl --set-version <distro-name> 2")
+                print("      See: https://docs.microsoft.com/en-us/windows/wsl/install")
+
+                # Check if GPU is actually working despite WSL1
+                if not platform_info.get("cuda_available"):
+                    print("\n❌ GPU not available. Exiting...")
+                    exit(1)
+            else:
+                print("   ✅ WSL2 detected - GPU support available")
+
+                # Check WSL GPU support
+                wsl_gpu = self.check_wsl_gpu_support()
+                if not wsl_gpu["supported"]:
+                    print(f"\n⚠️  WSL GPU Support Issues:")
+                    for issue in wsl_gpu["issues"]:
+                        print(f"   • {issue}")
+                    print("\n💡 To fix WSL GPU support:")
+                    print("   1. Update Windows to latest version")
+                    print("   2. Install NVIDIA drivers for WSL:")
+                    print("      https://docs.nvidia.com/cuda/wsl-user-guide/index.html")
+                    print("   3. Restart WSL: wsl --shutdown")
+                else:
+                    print(f"   ✅ NVIDIA Driver: {wsl_gpu['driver_version']}")
+                    print("   💡 WSL2 often provides better performance than Windows native")
+
         elif platform_info["is_windows"]:
-            print(f"\n📍 Platform: Windows")
+            print(f"\n📍 Platform: Windows (Native)")
             print("   💡 Consider using WSL2 for potentially better performance")
+            print("   💡 Install WSL2: wsl --install")
         elif platform_info["is_linux"]:
-            print(f"\n📍 Platform: Linux")
+            print(f"\n📍 Platform: Linux (Native)")
         elif platform_info["is_darwin"]:
             print(f"\n📍 Platform: macOS (GPU features limited)")
 
@@ -175,6 +246,8 @@ class GPUConfig:
                 print(f"      💎 Blackwell GPU detected!")
                 print(f"         • BF16 recommended for stability")
                 print(f"         • Flash Attention: build from source required")
+                if platform_info["is_wsl"]:
+                    print(f"         • WSL: Ensure latest NVIDIA drivers (560+)")
             elif gpu['is_ada_or_newer']:
                 print(f"      ✨ Ada Lovelace GPU - excellent performance")
                 print(f"         • Flash Attention available via pip")
@@ -191,6 +264,8 @@ class GPUConfig:
             if any(gpu['is_blackwell'] for gpu in gpus):
                 print(f"   ⚠️  Blackwell detected: Build from source required!")
                 print(f"      See INSTALLATION_UPDATED.md for instructions")
+            if platform_info["is_wsl"]:
+                print(f"   💡 In WSL, build from source recommended for best compatibility")
 
         print()
         print("="*70)
@@ -229,6 +304,13 @@ class GPUConfig:
         print(f"\n💡 To change GPU later:")
         print(f"   • Use --gpu <id> argument")
         print(f"   • Or delete: {self.CONFIG_FILE}")
+
+        if platform_info["is_wsl"]:
+            print(f"\n💡 WSL Tips:")
+            print(f"   • Use Linux paths for best compatibility")
+            print(f"   • Access Windows files via /mnt/c/...")
+            print(f"   • If you see multiprocessing errors, try fewer workers")
+
         print()
 
         return selected
