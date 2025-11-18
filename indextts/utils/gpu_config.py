@@ -173,6 +173,202 @@ class GPUConfig:
 
         return result
 
+    @staticmethod
+    def get_optimal_settings(compute_capability: Tuple[int, int]) -> Dict[str, any]:
+        """
+        Get optimal PyTorch settings based on GPU compute capability.
+
+        Returns architecture-specific recommendations for:
+        - Mixed precision dtype (FP16, BF16, TF32)
+        - Tensor Cores usage
+        - cuDNN benchmarking
+        - Flash Attention support
+
+        Args:
+            compute_capability: Tuple of (major, minor) compute capability
+
+        Returns:
+            Dictionary of recommended settings
+        """
+        major, minor = compute_capability
+        settings = {
+            "architecture": "Unknown",
+            "use_bf16": False,
+            "use_fp16": False,
+            "use_tf32": False,
+            "enable_flash_attn": False,
+            "cudnn_benchmark": True,  # Generally safe to enable
+            "recommended_dtype": "float32",
+            "tensor_cores_available": False,
+        }
+
+        # Blackwell (sm_100+): Latest features, best performance
+        if major >= 10:
+            settings.update({
+                "architecture": "Blackwell",
+                "use_bf16": True,
+                "use_tf32": True,
+                "enable_flash_attn": True,
+                "recommended_dtype": "bfloat16",
+                "tensor_cores_available": True,
+                "additional_optimizations": [
+                    "Use torch.compile for maximum performance",
+                    "Enable CUDA graphs for repeated inference",
+                    "Consider INT8 quantization for production",
+                ],
+            })
+
+        # Hopper (sm_90): High-end datacenter
+        elif major == 9:
+            settings.update({
+                "architecture": "Hopper",
+                "use_bf16": True,
+                "use_tf32": True,
+                "enable_flash_attn": True,
+                "recommended_dtype": "bfloat16",
+                "tensor_cores_available": True,
+                "additional_optimizations": [
+                    "Excellent for large batch sizes",
+                    "FP8 available (requires specific libraries)",
+                ],
+            })
+
+        # Ada Lovelace (sm_89): High-end consumer/pro
+        elif major == 8 and minor >= 9:
+            settings.update({
+                "architecture": "Ada Lovelace",
+                "use_bf16": True,
+                "use_fp16": True,
+                "use_tf32": True,
+                "enable_flash_attn": True,
+                "recommended_dtype": "bfloat16",
+                "tensor_cores_available": True,
+                "additional_optimizations": [
+                    "Excellent FP16 and BF16 performance",
+                    "Good for both training and inference",
+                ],
+            })
+
+        # Ampere (sm_80-86): Mainstream datacenter/pro
+        elif major == 8:
+            settings.update({
+                "architecture": "Ampere",
+                "use_bf16": True,
+                "use_fp16": True,
+                "use_tf32": True,
+                "enable_flash_attn": True,
+                "recommended_dtype": "bfloat16" if minor >= 0 else "float16",
+                "tensor_cores_available": True,
+                "additional_optimizations": [
+                    "First generation with BF16 support",
+                    "TF32 provides good balance of speed/precision",
+                ],
+            })
+
+        # Turing (sm_75): Consumer RTX 20-series
+        elif major == 7 and minor >= 5:
+            settings.update({
+                "architecture": "Turing",
+                "use_fp16": True,
+                "use_tf32": False,  # Not available
+                "enable_flash_attn": False,  # Requires sm_80+
+                "recommended_dtype": "float16",
+                "tensor_cores_available": True,
+                "additional_optimizations": [
+                    "Use FP16 for performance gains",
+                    "No BF16 or TF32 support",
+                ],
+            })
+
+        # Volta (sm_70): GTX 10-series, older datacenter
+        elif major == 7:
+            settings.update({
+                "architecture": "Volta",
+                "use_fp16": True,
+                "recommended_dtype": "float16",
+                "tensor_cores_available": True,
+                "additional_optimizations": [
+                    "FP16 only for Tensor Cores",
+                    "Consider upgrading for modern features",
+                ],
+            })
+
+        # Older architectures (sm_60 and below)
+        else:
+            settings.update({
+                "architecture": f"Legacy (sm_{major}{minor})",
+                "use_fp16": False,
+                "recommended_dtype": "float32",
+                "tensor_cores_available": False,
+                "additional_optimizations": [
+                    "Limited performance optimizations available",
+                    "Strongly recommend GPU upgrade",
+                ],
+            })
+
+        return settings
+
+    @staticmethod
+    def apply_optimal_settings(device_id: int = 0) -> Dict[str, any]:
+        """
+        Apply optimal PyTorch settings for the specified GPU.
+
+        Automatically configures:
+        - torch.backends.cudnn settings
+        - torch.set_float32_matmul_precision
+        - Environment variables for optimal performance
+
+        Args:
+            device_id: GPU device ID to optimize for
+
+        Returns:
+            Dictionary of applied settings
+        """
+        if not torch.cuda.is_available():
+            return {"status": "skipped", "reason": "CUDA not available"}
+
+        try:
+            import torch.backends.cudnn as cudnn
+
+            compute_cap = torch.cuda.get_device_capability(device_id)
+            settings = GPUConfig.get_optimal_settings(compute_cap)
+
+            # Apply cuDNN settings
+            if settings["cudnn_benchmark"]:
+                cudnn.benchmark = True
+
+            cudnn.deterministic = False  # Disable for performance
+            cudnn.allow_tf32 = settings["use_tf32"]
+
+            # Configure TF32 for matmul operations
+            if settings["use_tf32"]:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                # Set precision mode
+                torch.set_float32_matmul_precision('high')  # Use TF32 for float32 ops
+            else:
+                torch.set_float32_matmul_precision('highest')  # Full FP32
+
+            # Set environment variables for optimal performance
+            if settings.get("architecture") == "Blackwell":
+                os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "0")
+                os.environ.setdefault("TORCH_CUDNN_V8_API_ENABLED", "1")
+
+            applied = {
+                "status": "applied",
+                "device_id": device_id,
+                "architecture": settings["architecture"],
+                "cudnn_benchmark": settings["cudnn_benchmark"],
+                "tf32_enabled": settings["use_tf32"],
+                "recommended_dtype": settings["recommended_dtype"],
+                "flash_attn_compatible": settings["enable_flash_attn"],
+            }
+
+            return applied
+
+        except Exception as e:
+            return {"status": "error", "reason": str(e)}
+
     def get_selected_gpu(self, cmd_arg: Optional[int] = None) -> Optional[int]:
         """
         Get selected GPU ID.
@@ -426,6 +622,17 @@ def setup_gpu(cmd_gpu_id: Optional[int] = None) -> Tuple[Optional[int], Dict]:
 
     # Set PyTorch to use selected GPU
     torch.cuda.set_device(gpu_id)
+
+    # Apply optimal settings for this GPU architecture
+    opt_result = GPUConfig.apply_optimal_settings(gpu_id)
+    if opt_result.get("status") == "applied":
+        print(f">> Applied optimal settings for {opt_result['architecture']} architecture")
+        if opt_result.get("tf32_enabled"):
+            print(f"   • TF32 enabled for faster matmul operations")
+        if opt_result.get("flash_attn_compatible"):
+            print(f"   • Flash Attention compatible (install with: uv sync --extra flashattn)")
+    elif opt_result.get("status") == "error":
+        print(f">> Warning: Could not apply optimal settings: {opt_result.get('reason')}")
 
     # Get GPU info
     gpus = config.get_gpu_info()

@@ -179,18 +179,54 @@ class WorkerPool:
             self.start_locked(count)
 
     def start_locked(self, count: int):
+        """
+        Start worker processes with multi-GPU assignment.
+
+        Workers are distributed across available GPUs in round-robin fashion.
+        Each worker gets an assigned GPU ID to maximize parallel throughput.
+        """
         self.job_queue = self.ctx.Queue()
         self.result_queue = self.ctx.Queue()
         self.processes = []
         self.worker_count = count
-        for _ in range(count):
+
+        # Detect available GPUs for distribution
+        available_gpus = self._get_available_gpus()
+
+        for worker_id in range(count):
+            # Round-robin GPU assignment
+            assigned_gpu = available_gpus[worker_id % len(available_gpus)] if available_gpus else None
+
+            # Create worker-specific config with GPU assignment
+            worker_config = self.config.copy()
+            worker_config["worker_id"] = worker_id
+            worker_config["assigned_gpu"] = assigned_gpu
+
             p = self.ctx.Process(
                 target=_worker_loop,
-                args=(self.job_queue, self.result_queue, self.config),
+                args=(self.job_queue, self.result_queue, worker_config),
                 daemon=True,
             )
             p.start()
             self.processes.append(p)
+
+            if assigned_gpu is not None:
+                logger.info(f"Started worker {worker_id} on GPU {assigned_gpu}")
+            else:
+                logger.info(f"Started worker {worker_id} on CPU")
+
+    def _get_available_gpus(self) -> List[int]:
+        """
+        Get list of available GPU device IDs.
+
+        Returns:
+            List of GPU IDs (e.g., [0, 1, 2] for a 3-GPU system)
+        """
+        if not torch.cuda.is_available():
+            return []
+
+        gpu_count = torch.cuda.device_count()
+        return list(range(gpu_count))
 
     def stop_locked(self):
         if not self.processes:
@@ -588,6 +624,25 @@ def _prepare_generation_kwargs(raw_kwargs: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _worker_loop(job_queue: mp.Queue, result_queue: mp.Queue, config: Dict[str, Any]):
+    """
+    Worker process main loop with multi-GPU support.
+
+    Each worker can be assigned to a specific GPU for parallel batch processing.
+    GPU assignment is configured via config["assigned_gpu"].
+    """
+    worker_id = config.get("worker_id", "unknown")
+    assigned_gpu = config.get("assigned_gpu")
+
+    # Set GPU device for this worker process
+    if assigned_gpu is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.set_device(assigned_gpu)
+            # Also set CUDA_VISIBLE_DEVICES to prevent worker from seeing other GPUs
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
+            logger.info(f"Worker {worker_id} initialized on GPU {assigned_gpu}")
+        except Exception as e:
+            logger.warning(f"Worker {worker_id} failed to set GPU {assigned_gpu}: {e}. Using default device.")
+
     hf_cache = config.get("hf_cache")
     torch_cache = config.get("torch_cache")
     if hf_cache:
@@ -605,6 +660,9 @@ def _worker_loop(job_queue: mp.Queue, result_queue: mp.Queue, config: Dict[str, 
         result_queue.put({"type": "init_error", "error": "No GPT/BPE model loaded. Use the Load button."})
         return
     try:
+        # Specify device explicitly based on assigned GPU
+        device = f"cuda:{assigned_gpu}" if assigned_gpu is not None and torch.cuda.is_available() else None
+
         worker_tts = IndexTTS2(
             model_dir=config["model_dir"],
             cfg_path=os.path.join(config["model_dir"], "config.yaml"),
@@ -613,6 +671,7 @@ def _worker_loop(job_queue: mp.Queue, result_queue: mp.Queue, config: Dict[str, 
             use_accel=True,
             gpt_checkpoint_path=gpt_override,
             bpe_model_path=bpe_override,
+            device=device,  # Explicitly set device for this worker
         )
     except Exception as exc:  # pragma: no cover - worker init path
         logger.exception("Worker failed to initialize")
