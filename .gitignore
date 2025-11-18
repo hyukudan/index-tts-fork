@@ -28,6 +28,7 @@ desktop.ini
 /cache/
 /checkpoints/*
 !/checkpoints/*.yaml
+!/checkpoints/*.md
 /outputs/
 *processed_data/
 DeepSpeed/
