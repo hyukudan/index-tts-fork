@@ -1060,6 +1060,13 @@ class IndexTTS2:
                     bigvgan_time += time.perf_counter() - m_start_time
                     wav = wav.squeeze(1)
 
+                # Normalize audio with headroom to prevent clipping
+                # Apply peak normalization with -1 dB headroom (0.891 = 10^(-1/20))
+                peak = wav.abs().max()
+                if peak > 0:
+                    target_peak = 0.891  # -1 dB headroom to prevent clipping
+                    wav = wav * (target_peak / peak)
+
                 wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
                 if verbose:
                     print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
