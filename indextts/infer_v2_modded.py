@@ -1060,16 +1060,60 @@ class IndexTTS2:
                     bigvgan_time += time.perf_counter() - m_start_time
                     wav = wav.squeeze(1)
 
-                # Direct int16 conversion without normalization (matches original repo)
-                wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
+                # Keep audio in float32 for now - normalization will be applied globally after concatenation
                 if verbose:
-                    print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
-                # wavs.append(wav[:, :-512])
-                wavs.append(wav.cpu())  # to cpu before saving
+                    peak = wav.abs().max().item()
+                    print(f"Fragment peak: {peak:.4f}")
+
+                wavs.append(wav.cpu())  # Keep as float32
         end_time = time.perf_counter()
         self._set_gr_progress(0.9, "save audio...")
         wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
         wav = torch.cat(wavs, dim=1)
+
+        # ============================================================================
+        # Global Audio Normalization Pipeline (after concatenation)
+        # ============================================================================
+        # Strategy: Work in float32 until final conversion, apply:
+        #   1. Peak headroom control (target -4 to -6 dBFS)
+        #   2. RMS-based loudness control (prevent overly compressed sound)
+        #   3. Soft limiter (smooth transient handling with tanh)
+        #   4. Convert to int16 only at the very end
+        # ============================================================================
+
+        print(">> Applying global audio normalization...")
+
+        # 1. Peak Headroom Control
+        # Target peak at 0.3 (~-10.5 dBFS) to match example audio levels
+        peak = wav.abs().max().item()
+        target_peak = 0.3
+        gain_peak = target_peak / peak if peak > 0 else 1.0
+        print(f"   • Raw peak: {peak:.4f}")
+        print(f"   • Peak gain: {gain_peak:.4f} (target: {target_peak})")
+
+        # 2. RMS-based Loudness Control
+        # Target RMS at 0.08 (~-22 dBFS) to match example audio loudness
+        rms = wav.pow(2).mean().sqrt().item()
+        target_rms = 0.08
+        gain_rms = target_rms / rms if rms > 0 else 1.0
+        print(f"   • Raw RMS: {rms:.4f}")
+        print(f"   • RMS gain: {gain_rms:.4f} (target: {target_rms})")
+
+        # Apply the minimum gain to respect both peak and loudness constraints
+        gain = min(gain_peak, gain_rms)
+        wav = wav * gain
+        print(f"   • Final gain applied: {gain:.4f}")
+
+        # 3. Soft Limiter (optional but recommended)
+        # Uses tanh for smooth compression of transients above threshold
+        limiter_threshold = 0.8
+        # Apply soft limiting: tanh compresses values smoothly above threshold
+        # For |x| <= threshold: mostly linear
+        # For |x| > threshold: smooth compression toward ±1.0
+        wav = torch.tanh(wav / limiter_threshold) * limiter_threshold
+        final_peak = wav.abs().max().item()
+        print(f"   • After soft limiter: peak={final_peak:.4f}")
+
         wav_length = wav.shape[-1] / sampling_rate
 
         # Store telemetry data in instance variables for monitoring/UI display
@@ -1090,20 +1134,25 @@ class IndexTTS2:
 
         # save audio
         wav = wav.cpu()  # to cpu
+
+        # Ensure wav is in valid float32 range [-1.0, 1.0]
+        wav = wav.clamp(-1.0, 1.0).to(torch.float32)
+
         if output_path:
-            # 直接保存音频到指定路径中
+            # Save as float32 - torchaudio will convert to PCM_16 correctly, respecting amplitude
+            # This avoids torchaudio's automatic re-normalization that happens with int16 input
             if os.path.isfile(output_path):
                 os.remove(output_path)
                 print(">> remove old wav file:", output_path)
             if os.path.dirname(output_path) != "":
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)
+            torchaudio.save(output_path, wav, sampling_rate)
             print(">> wav file saved to:", output_path)
             return output_path
         else:
-            # 返回以符合Gradio的格式要求
-            wav_data = wav.type(torch.int16)
-            wav_data = wav_data.numpy().T
+            # For Gradio: convert to int16 only for the return value
+            wav_int16 = (wav * 32767.0).clamp(-32767.0, 32767.0).to(torch.int16)
+            wav_data = wav_int16.numpy().T
             return (sampling_rate, wav_data)
 
 
