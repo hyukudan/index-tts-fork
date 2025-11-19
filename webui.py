@@ -75,8 +75,11 @@ from indextts.utils.model_comparison import ModelComparator
 from indextts.utils.training_monitor import (
     TensorBoardManager,
     TrainingLogParser,
+    TrainingAnalyzer,
+    ExperimentTracker,
     find_training_logs,
-    get_tensorboard_logdir
+    get_tensorboard_logdir,
+    export_plot_to_png
 )
 import gc
 
@@ -108,6 +111,8 @@ _model_comparator = ModelComparator(_model_manager)
 
 # Initialize TensorBoard manager for training monitoring
 _tensorboard_manager = TensorBoardManager()
+_training_analyzer = TrainingAnalyzer()
+_experiment_tracker = ExperimentTracker()
 
 logger = logging.getLogger(__name__)
 
@@ -1014,6 +1019,79 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                         value=False
                     )
 
+                with gr.Row():
+                    monitor_export_loss = gr.Button("💾 Export Loss Plot", size="sm")
+                    monitor_export_lr = gr.Button("💾 Export LR Plot", size="sm")
+
+                monitor_export_status = gr.Markdown(value="")
+
+            # Alerts & Analysis
+            with gr.Accordion("🚨 Alerts & Analysis", open=False):
+                with gr.Row():
+                    monitor_target_step = gr.Number(
+                        label="Target Steps",
+                        value=10000,
+                        precision=0,
+                        info="For time estimation"
+                    )
+                    monitor_analyze_button = gr.Button("🔍 Analyze Training", variant="primary")
+
+                monitor_alerts_display = gr.Markdown(value="Click 'Analyze Training' to check for issues")
+
+            # Run Comparison
+            with gr.Accordion("📊 Compare Runs", open=False):
+                gr.Markdown("Compare multiple training runs to find the best configuration")
+
+                with gr.Row():
+                    monitor_compare_run1 = gr.Dropdown(
+                        choices=[],
+                        label="Run 1",
+                        scale=2
+                    )
+                    monitor_compare_run2 = gr.Dropdown(
+                        choices=[],
+                        label="Run 2",
+                        scale=2
+                    )
+                    monitor_compare_runs_button = gr.Button("⚖️ Compare", scale=1)
+
+                monitor_comparison_plot = gr.Plot(label="Loss Comparison")
+                monitor_comparison_stats = gr.Markdown(value="")
+
+            # Experiment Tracking Integration
+            with gr.Accordion("🔗 Experiment Tracking", open=False):
+                gr.Markdown("""
+                **Optional:** Sync metrics to external tracking platforms
+
+                - **W&B (Weights & Biases):** Cloud-based experiment tracking
+                - **MLflow:** Self-hosted experiment tracking
+                """)
+
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("#### Weights & Biases")
+                        monitor_wandb_project = gr.Textbox(
+                            label="W&B Project Name",
+                            placeholder="my-tts-project"
+                        )
+                        monitor_wandb_enabled = gr.Checkbox(
+                            label="Enable W&B logging",
+                            value=False
+                        )
+                        monitor_wandb_status = gr.Markdown(value="")
+
+                    with gr.Column():
+                        gr.Markdown("#### MLflow")
+                        monitor_mlflow_run = gr.Textbox(
+                            label="MLflow Run Name",
+                            placeholder="catalan_experiment_1"
+                        )
+                        monitor_mlflow_enabled = gr.Checkbox(
+                            label="Enable MLflow logging",
+                            value=False
+                        )
+                        monitor_mlflow_status = gr.Markdown(value="")
+
     # Handler functions
     def handle_model_selection_change(model_label, gpt_paths_mapping):
         """Update metadata displays when model selection changes."""
@@ -1682,6 +1760,161 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         )
 
         return loss_fig, lr_fig
+
+    def export_plot(project_name, plot_type):
+        """Export plot to PNG file."""
+        if not project_name:
+            return "⚠️ No project selected"
+
+        # Generate plots
+        loss_fig, lr_fig = refresh_training_plots(project_name)
+
+        # Choose which plot to export
+        fig = loss_fig if plot_type == "loss" else lr_fig
+
+        # Create export directory
+        export_dir = Path("outputs") / "training_plots"
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+        # Export
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = export_dir / f"{project_name}_{plot_type}_{timestamp}.png"
+
+        success = export_plot_to_png(fig, output_path)
+
+        if success:
+            gr.Info(f"Plot exported to {output_path}")
+            return f"✅ Exported to: `{output_path}`"
+        else:
+            return "❌ Export failed (install kaleido: pip install kaleido)"
+
+    def analyze_training(project_name, target_step):
+        """Analyze training for issues and estimate time."""
+        if not project_name:
+            return "⚠️ No project selected"
+
+        # Find and parse logs
+        log_files = find_training_logs(project_name)
+        if not log_files:
+            return "⚠️ No training logs found"
+
+        parser = TrainingLogParser(log_files[0])
+        metrics = parser.parse_log_file()
+
+        if not metrics:
+            return "⚠️ No metrics found in logs"
+
+        # Run analyses
+        analysis = "## 🔍 Training Analysis\n\n"
+
+        # 1. Plateau detection
+        is_plateau, plateau_msg = _training_analyzer.detect_plateau(metrics, patience=50)
+        if is_plateau:
+            analysis += f"### ⚠️ Plateau Alert\n{plateau_msg}\n\n"
+        else:
+            analysis += f"### ✅ Training Progress\n{plateau_msg}\n\n"
+
+        # 2. Divergence detection
+        is_diverging, div_msg = _training_analyzer.detect_divergence(metrics, threshold=10.0)
+        if is_diverging:
+            analysis += f"### 🔴 Divergence Alert\n{div_msg}\n\n"
+        else:
+            analysis += f"### ✅ Stability Check\n{div_msg}\n\n"
+
+        # 3. Time estimation
+        seconds, time_msg = _training_analyzer.estimate_time_remaining(metrics, int(target_step))
+        analysis += f"### {time_msg}\n\n"
+
+        # 4. Current stats
+        latest = metrics[-1]
+        analysis += f"### 📊 Current Stats\n"
+        analysis += f"- Current Step: {latest.step:,}\n"
+        analysis += f"- Current Loss: {latest.loss:.4f}\n"
+        analysis += f"- Learning Rate: {latest.learning_rate:.2e}\n"
+
+        if latest.grad_norm:
+            analysis += f"- Grad Norm: {latest.grad_norm:.4f}\n"
+
+        # 5. Recommendations
+        analysis += f"\n### 💡 Recommendations\n"
+        if is_plateau:
+            analysis += "- Consider reducing learning rate\n"
+            analysis += "- Check if you've reached model capacity\n"
+            analysis += "- Try adjusting batch size\n"
+        if is_diverging:
+            analysis += "- **URGENT:** Stop training immediately\n"
+            analysis += "- Reduce learning rate significantly\n"
+            analysis += "- Check for data quality issues\n"
+
+        return analysis
+
+    def compare_training_runs(run1_name, run2_name):
+        """Compare two training runs."""
+        import plotly.graph_objects as go
+
+        if not run1_name or not run2_name:
+            return go.Figure(), "⚠️ Select both runs to compare"
+
+        if run1_name == run2_name:
+            return go.Figure(), "⚠️ Please select different runs"
+
+        # Parse both runs
+        runs = {}
+        for run_name in [run1_name, run2_name]:
+            log_files = find_training_logs(run_name)
+            if log_files:
+                parser = TrainingLogParser(log_files[0])
+                runs[run_name] = parser.parse_log_file()
+
+        if len(runs) != 2:
+            return go.Figure(), "⚠️ Could not load logs for both runs"
+
+        # Create comparison plot
+        fig = go.Figure()
+
+        colors = ['#2563eb', '#dc2626']
+        for i, (run_name, metrics) in enumerate(runs.items()):
+            steps = [m.step for m in metrics]
+            losses = [m.loss for m in metrics]
+
+            fig.add_trace(go.Scatter(
+                x=steps,
+                y=losses,
+                mode='lines+markers',
+                name=run_name,
+                line=dict(color=colors[i], width=2),
+                marker=dict(size=4)
+            ))
+
+        fig.update_layout(
+            title="Training Loss Comparison",
+            xaxis_title="Training Step",
+            yaxis_title="Loss",
+            template="plotly_white",
+            hovermode='x unified',
+            legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99)
+        )
+
+        # Get comparison stats
+        comparison = _training_analyzer.compare_runs(runs)
+
+        stats = f"## 📊 Run Comparison\n\n"
+
+        for run_name, run_stats in comparison.items():
+            if run_name.startswith('_'):
+                continue
+
+            stats += f"### {run_name}\n"
+            stats += f"- Best Loss: {run_stats['best_loss']:.4f}\n"
+            stats += f"- Final Loss: {run_stats['final_loss']:.4f}\n"
+            stats += f"- Average Loss: {run_stats['avg_loss']:.4f}\n"
+            stats += f"- Total Steps: {run_stats['total_steps']:,}\n"
+            stats += f"- Final LR: {run_stats['final_lr']:.2e}\n\n"
+
+        stats += f"### 🏆 Winner\n"
+        stats += f"**{comparison['_best_run']}** with best loss of **{comparison['_best_loss']:.4f}**"
+
+        return fig, stats
 
     def clear_history_all():
         """Clear all history."""
@@ -2475,6 +2708,38 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         refresh_training_status,
         inputs=[monitor_project_selector],
         outputs=monitor_status_display
+    )
+
+    # Export handlers
+    monitor_export_loss.click(
+        lambda project: export_plot(project, "loss"),
+        inputs=[monitor_project_selector],
+        outputs=monitor_export_status
+    )
+
+    monitor_export_lr.click(
+        lambda project: export_plot(project, "lr"),
+        inputs=[monitor_project_selector],
+        outputs=monitor_export_status
+    )
+
+    # Analysis handler
+    monitor_analyze_button.click(
+        analyze_training,
+        inputs=[monitor_project_selector, monitor_target_step],
+        outputs=monitor_alerts_display
+    )
+
+    # Comparison handlers
+    monitor_refresh_projects.click(
+        lambda: gr.update(choices=refresh_training_projects().choices),
+        outputs=[monitor_compare_run1, monitor_compare_run2]
+    )
+
+    monitor_compare_runs_button.click(
+        compare_training_runs,
+        inputs=[monitor_compare_run1, monitor_compare_run2],
+        outputs=[monitor_comparison_plot, monitor_comparison_stats]
     )
 
 

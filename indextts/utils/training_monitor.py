@@ -313,3 +313,297 @@ def find_training_logs(project_name: str, training_root: Path = Path("training")
 def get_tensorboard_logdir(project_name: str, training_root: Path = Path("training")) -> Path:
     """Get TensorBoard log directory for a project."""
     return training_root / project_name / "checkpoints" / "runs"
+
+
+class TrainingAnalyzer:
+    """Advanced training analysis and alerting."""
+
+    def __init__(self, window_size: int = 100):
+        """
+        Initialize analyzer.
+
+        Args:
+            window_size: Number of steps to consider for trend analysis
+        """
+        self.window_size = window_size
+
+    def detect_plateau(self, metrics: List[TrainingMetrics], patience: int = 50) -> Tuple[bool, str]:
+        """
+        Detect if loss has plateaued (stopped improving).
+
+        Args:
+            metrics: List of training metrics
+            patience: Number of steps without improvement to consider plateau
+
+        Returns:
+            (is_plateau, message)
+        """
+        if len(metrics) < patience:
+            return False, "Not enough data yet"
+
+        # Get recent losses
+        recent_losses = [m.loss for m in metrics[-patience:]]
+
+        # Check if there's significant improvement
+        first_half_avg = sum(recent_losses[:patience//2]) / (patience//2)
+        second_half_avg = sum(recent_losses[patience//2:]) / (patience - patience//2)
+
+        improvement = (first_half_avg - second_half_avg) / first_half_avg
+
+        if improvement < 0.001:  # Less than 0.1% improvement
+            return True, f"⚠️ Loss plateau detected! No significant improvement in last {patience} steps (improvement: {improvement*100:.3f}%)"
+
+        return False, f"Training progressing (improvement: {improvement*100:.2f}%)"
+
+    def detect_divergence(self, metrics: List[TrainingMetrics], threshold: float = 10.0) -> Tuple[bool, str]:
+        """
+        Detect if training is diverging (loss increasing).
+
+        Args:
+            metrics: List of training metrics
+            threshold: Loss increase threshold to consider divergence
+
+        Returns:
+            (is_diverging, message)
+        """
+        if len(metrics) < 10:
+            return False, "Not enough data yet"
+
+        recent_losses = [m.loss for m in metrics[-10:]]
+
+        # Check if loss is consistently increasing
+        increasing_count = sum(1 for i in range(1, len(recent_losses)) if recent_losses[i] > recent_losses[i-1])
+
+        if increasing_count >= 7:  # 7 out of 10 steps increasing
+            avg_loss = sum(recent_losses) / len(recent_losses)
+            if avg_loss > threshold:
+                return True, f"🔴 Training divergence detected! Loss increasing (avg: {avg_loss:.4f})"
+
+        return False, "Loss stable or decreasing"
+
+    def estimate_time_remaining(
+        self,
+        metrics: List[TrainingMetrics],
+        target_step: int
+    ) -> Tuple[Optional[float], str]:
+        """
+        Estimate time remaining to reach target step.
+
+        Args:
+            metrics: List of training metrics with timing info
+            target_step: Target training step
+
+        Returns:
+            (seconds_remaining, formatted_string)
+        """
+        if not metrics or not metrics[-1].time_per_step:
+            return None, "⏱️ No timing data available"
+
+        current_step = metrics[-1].step
+        remaining_steps = target_step - current_step
+
+        if remaining_steps <= 0:
+            return 0, "✅ Target reached!"
+
+        # Calculate average time per step from recent metrics
+        recent_with_time = [m for m in metrics[-100:] if m.time_per_step]
+
+        if not recent_with_time:
+            return None, "⏱️ No timing data available"
+
+        avg_time_per_step = sum(m.time_per_step for m in recent_with_time) / len(recent_with_time)
+
+        seconds_remaining = remaining_steps * avg_time_per_step
+
+        # Format time
+        hours = int(seconds_remaining // 3600)
+        minutes = int((seconds_remaining % 3600) // 60)
+        seconds = int(seconds_remaining % 60)
+
+        if hours > 0:
+            time_str = f"⏱️ Estimated time remaining: {hours}h {minutes}m {seconds}s"
+        elif minutes > 0:
+            time_str = f"⏱️ Estimated time remaining: {minutes}m {seconds}s"
+        else:
+            time_str = f"⏱️ Estimated time remaining: {seconds}s"
+
+        return seconds_remaining, time_str
+
+    def compare_runs(
+        self,
+        runs: Dict[str, List[TrainingMetrics]]
+    ) -> Dict[str, any]:
+        """
+        Compare multiple training runs.
+
+        Args:
+            runs: Dictionary mapping run name to list of metrics
+
+        Returns:
+            Comparison statistics
+        """
+        comparison = {}
+
+        for run_name, metrics in runs.items():
+            if not metrics:
+                continue
+
+            losses = [m.loss for m in metrics]
+
+            comparison[run_name] = {
+                'final_loss': losses[-1] if losses else None,
+                'best_loss': min(losses) if losses else None,
+                'worst_loss': max(losses) if losses else None,
+                'avg_loss': sum(losses) / len(losses) if losses else None,
+                'total_steps': metrics[-1].step if metrics else 0,
+                'final_lr': metrics[-1].learning_rate if metrics else None,
+            }
+
+        # Find best run
+        best_run = min(
+            comparison.items(),
+            key=lambda x: x[1]['best_loss'] if x[1]['best_loss'] else float('inf')
+        )
+
+        comparison['_best_run'] = best_run[0]
+        comparison['_best_loss'] = best_run[1]['best_loss']
+
+        return comparison
+
+
+def export_plot_to_png(fig, output_path: Path) -> bool:
+    """
+    Export Plotly figure to PNG.
+
+    Args:
+        fig: Plotly figure object
+        output_path: Output path for PNG file
+
+    Returns:
+        Success status
+    """
+    try:
+        import plotly.io as pio
+
+        # Ensure kaleido is installed for static image export
+        try:
+            pio.write_image(fig, str(output_path), format='png', width=1200, height=600)
+            logger.info(f"Exported plot to {output_path}")
+            return True
+        except ImportError:
+            logger.warning("kaleido not installed. Install with: pip install kaleido")
+            return False
+        except Exception as e:
+            logger.error(f"Error exporting plot: {e}")
+            return False
+    except Exception as e:
+        logger.error(f"Error importing plotly.io: {e}")
+        return False
+
+
+class ExperimentTracker:
+    """Integration with experiment tracking platforms."""
+
+    def __init__(self):
+        self.wandb_available = False
+        self.mlflow_available = False
+
+        try:
+            import wandb
+            self.wandb_available = True
+        except ImportError:
+            pass
+
+        try:
+            import mlflow
+            self.mlflow_available = True
+        except ImportError:
+            pass
+
+    def log_to_wandb(
+        self,
+        project_name: str,
+        metrics: TrainingMetrics,
+        config: Dict = None
+    ) -> bool:
+        """
+        Log metrics to Weights & Biases.
+
+        Args:
+            project_name: W&B project name
+            metrics: Training metrics to log
+            config: Optional training configuration
+
+        Returns:
+            Success status
+        """
+        if not self.wandb_available:
+            logger.warning("wandb not installed. Install with: pip install wandb")
+            return False
+
+        try:
+            import wandb
+
+            # Initialize if not already done
+            if not wandb.run:
+                wandb.init(project=project_name, config=config or {})
+
+            # Log metrics
+            wandb.log({
+                'step': metrics.step,
+                'epoch': metrics.epoch,
+                'loss': metrics.loss,
+                'learning_rate': metrics.learning_rate,
+                'grad_norm': metrics.grad_norm,
+                'vram_gb': metrics.vram_gb,
+            }, step=metrics.step)
+
+            return True
+        except Exception as e:
+            logger.error(f"Error logging to wandb: {e}")
+            return False
+
+    def log_to_mlflow(
+        self,
+        run_name: str,
+        metrics: TrainingMetrics,
+        params: Dict = None
+    ) -> bool:
+        """
+        Log metrics to MLflow.
+
+        Args:
+            run_name: MLflow run name
+            metrics: Training metrics to log
+            params: Optional training parameters
+
+        Returns:
+            Success status
+        """
+        if not self.mlflow_available:
+            logger.warning("mlflow not installed. Install with: pip install mlflow")
+            return False
+
+        try:
+            import mlflow
+
+            # Start run if not active
+            if not mlflow.active_run():
+                mlflow.start_run(run_name=run_name)
+
+            # Log parameters (once)
+            if params:
+                mlflow.log_params(params)
+
+            # Log metrics
+            mlflow.log_metrics({
+                'loss': metrics.loss,
+                'learning_rate': metrics.learning_rate,
+                'grad_norm': metrics.grad_norm or 0.0,
+                'vram_gb': metrics.vram_gb or 0.0,
+            }, step=metrics.step)
+
+            return True
+        except Exception as e:
+            logger.error(f"Error logging to mlflow: {e}")
+            return False
