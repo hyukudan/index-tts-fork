@@ -81,6 +81,17 @@ from indextts.utils.training_monitor import (
     get_tensorboard_logdir,
     export_plot_to_png
 )
+from indextts.utils.emotion_presets import (
+    get_preset_choices,
+    get_preset_vector,
+    mix_emotions,
+    get_preset_description
+)
+from indextts.utils.duration_estimator import (
+    estimate_duration,
+    get_duration_display,
+    format_duration
+)
 import gc
 
 def cleanup_gpu_memory():
@@ -415,6 +426,7 @@ def gen_single(emo_control_method,prompt, text,
                vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
                emo_text,emo_random,
                max_text_tokens_per_sentence=120,
+               target_duration=0,
                 *args, progress=gr.Progress()):
     output_path = None
     if not output_path:
@@ -461,11 +473,15 @@ def gen_single(emo_control_method,prompt, text,
 
     print(f"Emo control mode:{emo_control_method},vec:{vec}")
     try:
+        # Convert target_duration to duration_seconds (0 means None/auto)
+        duration_seconds = float(target_duration) if target_duration and target_duration > 0 else None
+
         output = tts.infer(spk_audio_prompt=prompt, text=text,
                            output_path=output_path,
                            emo_audio_prompt=emo_ref_path, emo_alpha=emo_weight,
                            emo_vector=vec,
                            use_emo_text=(emo_control_method==3), emo_text=emo_text,use_random=emo_random,
+                           duration_seconds=duration_seconds,
                            verbose=cmd_args.verbose,
                            max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
                            **kwargs)
@@ -603,17 +619,60 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         emo_random = gr.Checkbox(label="Random Emotion Sampling", value=False, visible=False)
 
     with gr.Group(visible=False) as emotion_vector_group:
+        # Emotion Presets
         with gr.Row():
-            with gr.Column():
-                vec1 = gr.Slider(label="Joy", minimum=0.0, maximum=1.4, value=0.0, step=0.05)
-                vec2 = gr.Slider(label="Anger", minimum=0.0, maximum=1.4, value=0.0, step=0.05)
-                vec3 = gr.Slider(label="Sadness", minimum=0.0, maximum=1.4, value=0.0, step=0.05)
-                vec4 = gr.Slider(label="Fear", minimum=0.0, maximum=1.4, value=0.0, step=0.05)
-            with gr.Column():
-                vec5 = gr.Slider(label="Disgust", minimum=0.0, maximum=1.4, value=0.0, step=0.05)
-                vec6 = gr.Slider(label="Low Mood", minimum=0.0, maximum=1.4, value=0.0, step=0.05)
-                vec7 = gr.Slider(label="Surprise", minimum=0.0, maximum=1.4, value=0.0, step=0.05)
-                vec8 = gr.Slider(label="Calm", minimum=0.0, maximum=1.4, value=0.0, step=0.05)
+            with gr.Column(scale=3):
+                emotion_preset = gr.Dropdown(
+                    choices=get_preset_choices(),
+                    value="neutral",
+                    label="✨ Emotion Presets",
+                    info="Quick selection of common emotions"
+                )
+            with gr.Column(scale=1):
+                apply_preset_btn = gr.Button("Apply Preset", variant="primary", size="sm")
+
+        with gr.Accordion("Advanced: Custom Emotion Mix", open=False):
+            with gr.Row():
+                with gr.Column():
+                    mix_preset_a = gr.Dropdown(
+                        choices=[choice for choice in get_preset_choices() if choice[1] != "custom"],
+                        value="neutral",
+                        label="Emotion A",
+                        scale=2
+                    )
+                with gr.Column(scale=1):
+                    mix_ratio = gr.Slider(
+                        label="A ← → B",
+                        minimum=0,
+                        maximum=100,
+                        value=50,
+                        step=5,
+                        info="0% = A only, 100% = B only"
+                    )
+                with gr.Column():
+                    mix_preset_b = gr.Dropdown(
+                        choices=[choice for choice in get_preset_choices() if choice[1] != "custom"],
+                        value="happy",
+                        label="Emotion B",
+                        scale=2
+                    )
+            with gr.Row():
+                apply_mix_btn = gr.Button("Apply Mix", variant="secondary", size="sm")
+                preset_description = gr.Markdown(value=get_preset_description("neutral"))
+
+        # Manual Sliders
+        with gr.Accordion("Expert: Manual Vector Control", open=False):
+            with gr.Row():
+                with gr.Column():
+                    vec1 = gr.Slider(label="Happiness", minimum=0.0, maximum=1.4, value=0.0, step=0.05)
+                    vec2 = gr.Slider(label="Anger", minimum=0.0, maximum=1.4, value=0.0, step=0.05)
+                    vec3 = gr.Slider(label="Sadness", minimum=0.0, maximum=1.4, value=0.0, step=0.05)
+                    vec4 = gr.Slider(label="Surprise", minimum=0.0, maximum=1.4, value=0.0, step=0.05)
+                with gr.Column():
+                    vec5 = gr.Slider(label="Disgust", minimum=0.0, maximum=1.4, value=0.0, step=0.05)
+                    vec6 = gr.Slider(label="Fear", minimum=0.0, maximum=1.4, value=0.0, step=0.05)
+                    vec7 = gr.Slider(label="Arousal", minimum=0.0, maximum=1.4, value=0.0, step=0.05)
+                    vec8 = gr.Slider(label="Calm", minimum=0.0, maximum=1.4, value=0.0, step=0.05)
 
     with gr.Group(visible=False) as emo_text_group:
         with gr.Row():
@@ -664,8 +723,28 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                                         sources=["upload", "microphone"], type="filepath")
                 with gr.Column():
                     input_text_single = gr.TextArea(label="Text", key="input_text_single", placeholder="Enter text to synthesize", info=f"Model version {tts.model_version or '1.0'}")
+
+                    # Duration estimation and control
+                    with gr.Row():
+                        with gr.Column(scale=2):
+                            duration_estimate_display = gr.Markdown(value="📊 Enter text to see duration estimate", label="Duration Preview")
+                        with gr.Column(scale=1):
+                            target_duration = gr.Number(
+                                label="Target Duration (seconds)",
+                                value=0,
+                                minimum=0,
+                                maximum=30,
+                                step=0.1,
+                                info="0 = auto"
+                            )
+
                     gen_button = gr.Button("Generate", key="gen_button", interactive=True)
+
             output_audio = gr.Audio(label="Generated Result", visible=True, key="output_audio")
+
+            # Waveform visualization
+            with gr.Row():
+                waveform_plot = gr.Plot(label="Audio Waveform", visible=False)
 
             if len(example_cases) > 0:
                 gr.Examples(
@@ -1205,6 +1284,40 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
     def refresh_monitor():
         """Refresh GPU monitor."""
         return get_gpu_monitor_text()
+
+    # Emotion preset handlers
+    def apply_emotion_preset(preset_id):
+        """Apply emotion preset to sliders."""
+        if preset_id == "custom":
+            return [gr.update()] * 8  # No change for custom
+
+        vector = get_preset_vector(preset_id)
+        if vector is None:
+            return [gr.update()] * 8
+
+        # Return updates for all 8 sliders
+        return [gr.update(value=v) for v in vector]
+
+    def apply_emotion_mix(preset_a, preset_b, ratio):
+        """Apply mixed emotion to sliders."""
+        # Convert ratio from 0-100 to 0.0-1.0
+        ratio_normalized = ratio / 100.0
+        mixed_vector = mix_emotions(preset_a, preset_b, ratio_normalized)
+
+        # Return updates for all 8 sliders
+        return [gr.update(value=v) for v in mixed_vector]
+
+    def update_preset_description(preset_id):
+        """Update preset description display."""
+        return get_preset_description(preset_id)
+
+    # Duration estimation handler
+    def update_duration_estimate(text, speech_rate="normal"):
+        """Update duration estimation display."""
+        if not text or len(text.strip()) == 0:
+            return "📊 Enter text to see duration estimate"
+
+        return get_duration_display(text, speech_rate)
 
     def handle_compare_model_info_update(model_label, gpt_paths_mapping):
         """Update model info display for comparison."""
@@ -2553,9 +2666,36 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                             vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
                              emo_text,emo_random,
                              max_text_tokens_per_sentence,
+                             target_duration,
                              *advanced_params,
                      ],
                      outputs=[output_audio])
+
+    # Emotion preset connections
+    apply_preset_btn.click(
+        apply_emotion_preset,
+        inputs=[emotion_preset],
+        outputs=[vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]
+    )
+
+    apply_mix_btn.click(
+        apply_emotion_mix,
+        inputs=[mix_preset_a, mix_preset_b, mix_ratio],
+        outputs=[vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]
+    )
+
+    emotion_preset.change(
+        update_preset_description,
+        inputs=[emotion_preset],
+        outputs=[preset_description]
+    )
+
+    # Duration estimation update
+    input_text_single.change(
+        update_duration_estimate,
+        inputs=[input_text_single],
+        outputs=[duration_estimate_display]
+    )
 
     batch_file_input.upload(
         add_batch_prompts,
