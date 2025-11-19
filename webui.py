@@ -744,6 +744,203 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                 visible=False
             )
 
+        with gr.Tab("Training Setup"):
+            gr.Markdown("""
+            ### 🎓 Train New Language Model
+
+            Configure and train a new TTS model for a specific language or use case.
+            All files will be automatically named and organized.
+            """)
+
+            # Project configuration
+            with gr.Accordion("Project Configuration", open=True):
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        train_project_name = gr.Textbox(
+                            label="Project/Language Name",
+                            placeholder="e.g., catalan, french, multilingual_romance",
+                            info="Used for naming all output files (gpt_{name}.pth, {name}_bpe.model)",
+                            value=""
+                        )
+                    with gr.Column(scale=1):
+                        train_vocab_size = gr.Number(
+                            label="Vocabulary Size",
+                            value=12000,
+                            precision=0,
+                            info="Tokenizer vocabulary size"
+                        )
+
+                with gr.Row():
+                    train_description = gr.Textbox(
+                        label="Description (optional)",
+                        placeholder="Brief description of this model (e.g., 'Catalan TTS with Barcelona accent')",
+                        lines=2
+                    )
+
+                # Display computed paths
+                train_paths_display = gr.Markdown(
+                    value="**Enter a project name to see computed paths**",
+                    visible=True
+                )
+
+            # Dataset configuration
+            with gr.Accordion("Dataset Configuration", open=True):
+                with gr.Row():
+                    train_manifest = gr.File(
+                        label="Training Manifest (JSONL)",
+                        file_types=[".jsonl"],
+                        type="filepath"
+                    )
+                    train_val_manifest = gr.File(
+                        label="Validation Manifest (JSONL)",
+                        file_types=[".jsonl"],
+                        type="filepath"
+                    )
+
+                train_dataset_info = gr.Markdown(
+                    value="Upload paired manifests (use tools/build_gpt_prompt_pairs.py to create them)"
+                )
+
+            # Tokenizer training
+            with gr.Accordion("Step 1: Train Tokenizer", open=False):
+                gr.Markdown("Train a BPE tokenizer on your text data")
+
+                with gr.Row():
+                    train_tokenizer_manifest = gr.File(
+                        label="Raw Text Manifest (JSONL)",
+                        file_types=[".jsonl"],
+                        type="filepath",
+                        info="Manifest with 'text' field (before pairing)"
+                    )
+
+                with gr.Row():
+                    train_char_coverage = gr.Slider(
+                        label="Character Coverage",
+                        minimum=0.90,
+                        maximum=1.0,
+                        value=0.9995,
+                        step=0.0001,
+                        info="Keep near 1.0 for languages with many characters (e.g., Chinese, Japanese)"
+                    )
+
+                with gr.Row():
+                    train_tokenizer_button = gr.Button(
+                        "🔤 Train Tokenizer",
+                        variant="primary",
+                        size="lg"
+                    )
+
+                train_tokenizer_status = gr.Markdown(value="Ready to train tokenizer")
+                train_tokenizer_output = gr.Textbox(
+                    label="Tokenizer Training Log",
+                    lines=10,
+                    max_lines=20,
+                    visible=False
+                )
+
+            # Model training
+            with gr.Accordion("Step 2: Fine-tune Model", open=False):
+                gr.Markdown("Fine-tune the GPT model on your language")
+
+                with gr.Row():
+                    with gr.Column():
+                        train_base_checkpoint = gr.Dropdown(
+                            choices=[Path(p).name for p in gpt_checkpoints],
+                            value=Path(gpt_checkpoints[0]).name if gpt_checkpoints else None,
+                            label="Base Checkpoint",
+                            info="Starting point for fine-tuning"
+                        )
+
+                    with gr.Column():
+                        train_gpu_id = gr.Dropdown(
+                            choices=[(f"GPU {i}", i) for i in range(torch.cuda.device_count())],
+                            value=0,
+                            label="Training GPU",
+                            info="GPU to use for training"
+                        )
+
+                with gr.Row():
+                    with gr.Column():
+                        train_batch_size = gr.Number(
+                            label="Batch Size",
+                            value=4,
+                            precision=0,
+                            info="Reduce if you get OOM errors"
+                        )
+                        train_epochs = gr.Number(
+                            label="Epochs",
+                            value=10,
+                            precision=0,
+                            info="Number of training epochs"
+                        )
+
+                    with gr.Column():
+                        train_learning_rate = gr.Number(
+                            label="Learning Rate",
+                            value=2e-5,
+                            info="Recommended: 1e-5 to 5e-5"
+                        )
+                        train_warmup_steps = gr.Number(
+                            label="Warmup Steps",
+                            value=500,
+                            precision=0,
+                            info="LR warmup steps"
+                        )
+
+                with gr.Row():
+                    train_use_amp = gr.Checkbox(
+                        label="Use Mixed Precision (AMP)",
+                        value=True,
+                        info="Faster training with FP16"
+                    )
+
+                with gr.Row():
+                    train_model_button = gr.Button(
+                        "🚀 Start Training",
+                        variant="primary",
+                        size="lg"
+                    )
+                    train_stop_button = gr.Button(
+                        "⏹️ Stop Training",
+                        variant="stop",
+                        size="lg"
+                    )
+
+                train_model_status = gr.Markdown(value="Ready to start training")
+                train_model_output = gr.Textbox(
+                    label="Training Log",
+                    lines=15,
+                    max_lines=30,
+                    visible=False
+                )
+
+            # Model installation
+            with gr.Accordion("Step 3: Install Trained Model", open=False):
+                gr.Markdown("Install the best checkpoint for use in WebUI")
+
+                with gr.Row():
+                    train_checkpoint_selector = gr.Dropdown(
+                        choices=[],
+                        label="Select Checkpoint",
+                        info="Choose the best checkpoint to install",
+                        interactive=True
+                    )
+                    train_refresh_checkpoints_button = gr.Button(
+                        "🔄 Refresh",
+                        size="sm"
+                    )
+
+                train_checkpoint_info = gr.Markdown(value="No checkpoints found yet")
+
+                with gr.Row():
+                    train_install_button = gr.Button(
+                        "📦 Install Model to WebUI",
+                        variant="primary",
+                        size="lg"
+                    )
+
+                train_install_status = gr.Markdown(value="Ready to install")
+
     # Handler functions
     def handle_model_selection_change(model_label, gpt_paths_mapping):
         """Update metadata displays when model selection changes."""
@@ -918,6 +1115,276 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                 gr.update(visible=False), gr.update(visible=False),
                 gr.update(visible=False), gr.update(visible=False)
             )
+
+    def handle_train_project_name_change(project_name):
+        """Update path displays when project name changes."""
+        if not project_name or not project_name.strip():
+            return "**Enter a project name to see computed paths**"
+
+        name = project_name.strip().lower().replace(" ", "_")
+
+        paths_info = f"""
+**Computed Paths:**
+
+📁 **Training Directory:** `training/{name}/`
+- Tokenizer: `training/{name}/tokenizer/{name}_bpe.model`
+- Checkpoints: `training/{name}/checkpoints/model_stepXXXX.pth`
+- Logs: `training/{name}/checkpoints/runs/`
+
+📦 **Final Model Files:**
+- Model: `models/gpt_{name}.pth`
+- Tokenizer: `models/{name}_bpe.model`
+- Config: `models/{name}_config.yaml`
+
+✅ Base models in `checkpoints/` will NOT be modified
+"""
+        return paths_info
+
+    def handle_train_tokenizer(
+        project_name, vocab_size, char_coverage, tokenizer_manifest
+    ):
+        """Train BPE tokenizer."""
+        import subprocess
+        from pathlib import Path
+
+        if not project_name or not project_name.strip():
+            gr.Warning("Please enter a project name")
+            return "❌ No project name provided", gr.update(visible=False)
+
+        if not tokenizer_manifest:
+            gr.Warning("Please upload a raw text manifest")
+            return "❌ No manifest provided", gr.update(visible=False)
+
+        name = project_name.strip().lower().replace(" ", "_")
+        tokenizer_dir = Path(f"training/{name}/tokenizer")
+        tokenizer_prefix = tokenizer_dir / f"{name}_bpe"
+
+        try:
+            # Run tokenizer training script
+            cmd = [
+                "python", "tools/tokenizer/train_bpe.py",
+                "--manifest", tokenizer_manifest,
+                "--output-prefix", str(tokenizer_prefix),
+                "--vocab-size", str(int(vocab_size)),
+                "--character-coverage", str(char_coverage)
+            ]
+
+            status_msg = f"🔄 Training tokenizer for '{name}'...\n"
+            status_msg += f"Vocab size: {int(vocab_size)}\n"
+            status_msg += f"Character coverage: {char_coverage}\n"
+
+            gr.Info(f"Starting tokenizer training for {name}...")
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600  # 10 minute timeout
+            )
+
+            if result.returncode == 0:
+                status_msg += f"\n✅ **Tokenizer trained successfully!**\n"
+                status_msg += f"📍 Location: `{tokenizer_prefix}.model`\n"
+                gr.Info(f"Tokenizer training completed for {name}!")
+                return status_msg, gr.update(value=result.stdout, visible=True)
+            else:
+                status_msg += f"\n❌ **Training failed**\n"
+                error_msg = result.stderr or result.stdout
+                gr.Warning(f"Tokenizer training failed: {error_msg[:200]}")
+                return status_msg, gr.update(value=error_msg, visible=True)
+
+        except subprocess.TimeoutExpired:
+            gr.Warning("Tokenizer training timed out (>10 minutes)")
+            return "❌ Training timed out", gr.update(visible=False)
+        except Exception as e:
+            logger.exception("Tokenizer training error")
+            gr.Warning(f"Training error: {str(e)}")
+            return f"❌ Error: {str(e)}", gr.update(visible=False)
+
+    def handle_train_model(
+        project_name,
+        train_manifest,
+        val_manifest,
+        base_checkpoint,
+        gpu_id,
+        batch_size,
+        epochs,
+        learning_rate,
+        warmup_steps,
+        use_amp,
+        gpt_paths
+    ):
+        """Start model training."""
+        import subprocess
+        from pathlib import Path
+
+        if not project_name or not project_name.strip():
+            gr.Warning("Please enter a project name")
+            return "❌ No project name provided", gr.update(visible=False)
+
+        if not train_manifest or not val_manifest:
+            gr.Warning("Please upload both training and validation manifests")
+            return "❌ Manifests missing", gr.update(visible=False)
+
+        name = project_name.strip().lower().replace(" ", "_")
+        tokenizer_path = Path(f"training/{name}/tokenizer/{name}_bpe.model")
+
+        if not tokenizer_path.exists():
+            gr.Warning(f"Tokenizer not found at {tokenizer_path}. Train tokenizer first!")
+            return f"❌ Tokenizer not found: {tokenizer_path}", gr.update(visible=False)
+
+        base_ckpt_path = next((p for p in gpt_paths if Path(p).name == base_checkpoint), None)
+        if not base_ckpt_path:
+            gr.Warning(f"Base checkpoint not found: {base_checkpoint}")
+            return "❌ Base checkpoint not found", gr.update(visible=False)
+
+        output_dir = Path(f"training/{name}/checkpoints")
+
+        try:
+            # Build training command
+            cmd = [
+                "python", "trainers/train_gpt_v2.py",
+                "--train-manifest", train_manifest,
+                "--val-manifest", val_manifest,
+                "--tokenizer", str(tokenizer_path),
+                "--config", "checkpoints/config.yaml",
+                "--base-checkpoint", base_ckpt_path,
+                "--output-dir", str(output_dir),
+                "--batch-size", str(int(batch_size)),
+                "--epochs", str(int(epochs)),
+                "--learning-rate", str(learning_rate),
+                "--warmup-steps", str(int(warmup_steps)),
+            ]
+
+            if use_amp:
+                cmd.append("--amp")
+
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+            status_msg = f"🚀 **Training started for '{name}'**\n\n"
+            status_msg += f"📊 Configuration:\n"
+            status_msg += f"- Base: {base_checkpoint}\n"
+            status_msg += f"- Tokenizer: {tokenizer_path.name}\n"
+            status_msg += f"- GPU: {gpu_id}\n"
+            status_msg += f"- Batch size: {int(batch_size)}\n"
+            status_msg += f"- Epochs: {int(epochs)}\n"
+            status_msg += f"- Learning rate: {learning_rate}\n"
+            status_msg += f"- Output: `{output_dir}/`\n\n"
+            status_msg += "⏳ Training in progress... (this may take hours)\n"
+            status_msg += "Check TensorBoard: `tensorboard --logdir " + str(output_dir / "runs") + "`\n"
+
+            gr.Info(f"Training started for {name}! Check console for progress.")
+
+            # Note: Running training in background would be better with a proper job queue
+            # For now, we show the command and let user run it in terminal
+            command_str = " ".join(cmd)
+            log_msg = f"Run this command in a terminal:\n\nCUDA_VISIBLE_DEVICES={gpu_id} {command_str}\n"
+
+            return status_msg, gr.update(value=log_msg, visible=True)
+
+        except Exception as e:
+            logger.exception("Training setup error")
+            gr.Warning(f"Training setup error: {str(e)}")
+            return f"❌ Error: {str(e)}", gr.update(visible=False)
+
+    def handle_refresh_checkpoints(project_name):
+        """Refresh checkpoint list."""
+        from pathlib import Path
+
+        if not project_name or not project_name.strip():
+            return gr.update(choices=[]), "Enter a project name first"
+
+        name = project_name.strip().lower().replace(" ", "_")
+        checkpoint_dir = Path(f"training/{name}/checkpoints")
+
+        if not checkpoint_dir.exists():
+            return gr.update(choices=[]), f"No checkpoints found. Directory `{checkpoint_dir}` doesn't exist."
+
+        # Find all checkpoint files
+        checkpoints = list(checkpoint_dir.glob("model_step*.pth"))
+        checkpoints.sort(key=lambda p: int(p.stem.replace("model_step", "")))
+
+        if not checkpoints:
+            return gr.update(choices=[]), "No checkpoints found yet. Start training first!"
+
+        choices = [str(ckpt.relative_to(Path.cwd())) for ckpt in checkpoints]
+
+        # Also add latest.pth if it exists
+        latest_path = checkpoint_dir / "latest.pth"
+        if latest_path.exists():
+            choices.append(str(latest_path.relative_to(Path.cwd())))
+
+        info_msg = f"**Found {len(checkpoints)} checkpoints:**\n"
+        for ckpt in checkpoints[-5:]:  # Show last 5
+            info_msg += f"- {ckpt.name}\n"
+
+        return gr.update(choices=choices, value=choices[-1] if choices else None), info_msg
+
+    def handle_install_model(project_name, checkpoint_path, description):
+        """Install trained model to models/ directory."""
+        import subprocess
+        from pathlib import Path
+
+        if not project_name or not project_name.strip():
+            gr.Warning("Please enter a project name")
+            return "❌ No project name provided"
+
+        if not checkpoint_path:
+            gr.Warning("Please select a checkpoint")
+            return "❌ No checkpoint selected"
+
+        name = project_name.strip().lower().replace(" ", "_")
+        tokenizer_path = Path(f"training/{name}/tokenizer/{name}_bpe.model")
+
+        if not tokenizer_path.exists():
+            gr.Warning(f"Tokenizer not found at {tokenizer_path}")
+            return f"❌ Tokenizer not found: {tokenizer_path}"
+
+        try:
+            # Run install script
+            cmd = [
+                "python", "tools/install_trained_model.py",
+                "--checkpoint", checkpoint_path,
+                "--tokenizer", str(tokenizer_path),
+                "--output-name", name,
+                "--output-dir", "models",
+            ]
+
+            if description:
+                cmd.extend(["--description", description])
+
+            cmd.append("--force")  # Auto-overwrite in UI mode
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+
+            if result.returncode == 0:
+                status_msg = f"✅ **Model installed successfully!**\n\n"
+                status_msg += f"📦 **Installed as:**\n"
+                status_msg += f"- `models/gpt_{name}.pth`\n"
+                status_msg += f"- `models/{name}_bpe.model`\n\n"
+                status_msg += "🎉 Your model is now available in the Model Checkpoint dropdown!\n"
+                status_msg += "Reload the page to see it."
+
+                gr.Info(f"Model {name} installed successfully!")
+                return status_msg
+            else:
+                error_msg = result.stderr or result.stdout
+                gr.Warning(f"Installation failed: {error_msg[:200]}")
+                return f"❌ Installation failed:\n{error_msg}"
+
+        except subprocess.TimeoutExpired:
+            gr.Warning("Installation timed out")
+            return "❌ Installation timed out"
+        except Exception as e:
+            logger.exception("Installation error")
+            gr.Warning(f"Installation error: {str(e)}")
+            return f"❌ Error: {str(e)}"
 
     def refresh_history_gallery():
         """Refresh history gallery."""
@@ -1633,6 +2100,58 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             compare_waveform_image,
             compare_metrics_display
         ]
+    )
+
+    # Training Setup tab handlers
+    train_project_name.change(
+        handle_train_project_name_change,
+        inputs=[train_project_name],
+        outputs=train_paths_display
+    )
+
+    train_tokenizer_button.click(
+        handle_train_tokenizer,
+        inputs=[
+            train_project_name,
+            train_vocab_size,
+            train_char_coverage,
+            train_tokenizer_manifest
+        ],
+        outputs=[train_tokenizer_status, train_tokenizer_output]
+    )
+
+    train_model_button.click(
+        handle_train_model,
+        inputs=[
+            train_project_name,
+            train_manifest,
+            train_val_manifest,
+            train_base_checkpoint,
+            train_gpu_id,
+            train_batch_size,
+            train_epochs,
+            train_learning_rate,
+            train_warmup_steps,
+            train_use_amp,
+            gpt_paths_state
+        ],
+        outputs=[train_model_status, train_model_output]
+    )
+
+    train_refresh_checkpoints_button.click(
+        handle_refresh_checkpoints,
+        inputs=[train_project_name],
+        outputs=[train_checkpoint_selector, train_checkpoint_info]
+    )
+
+    train_install_button.click(
+        handle_install_model,
+        inputs=[
+            train_project_name,
+            train_checkpoint_selector,
+            train_description
+        ],
+        outputs=train_install_status
     )
 
 
