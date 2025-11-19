@@ -368,11 +368,11 @@ def get_model_info_display(gpt_path):
 
 def get_gpu_selector_choices():
     """Get GPU choices for selector."""
-    gpus = _gpu_config_manager.detect_gpus()
+    gpus = _gpu_config_manager.get_gpu_info()
     choices = []
 
     for gpu in gpus:
-        label = f"GPU {gpu['id']}: {gpu['name']} ({gpu['memory_gb']:.1f} GB)"
+        label = f"GPU {gpu['id']}: {gpu['name']} ({gpu['total_memory_gb']:.1f} GB)"
         choices.append((label, gpu['id']))
 
     return choices
@@ -956,10 +956,9 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 
                 with gr.Row():
                     train_tokenizer_manifest = gr.File(
-                        label="Raw Text Manifest (JSONL)",
+                        label="Raw Text Manifest (JSONL) - Manifest with 'text' field (before pairing)",
                         file_types=[".jsonl"],
-                        type="filepath",
-                        info="Manifest with 'text' field (before pairing)"
+                        type="filepath"
                     )
 
                 with gr.Row():
