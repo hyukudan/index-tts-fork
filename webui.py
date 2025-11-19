@@ -971,6 +971,15 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             # Update GPU selection
             _current_gpu_id = gpu_id
 
+            # Apply architecture-specific optimizations for the selected GPU
+            # This ensures TF32, cuDNN, and other settings are optimal for the target GPU
+            if torch.cuda.is_available() and gpu_id < torch.cuda.device_count():
+                opt_result = GPUConfig.apply_optimal_settings(gpu_id)
+                if opt_result.get("status") == "applied":
+                    logger.info(f"Applied {opt_result['architecture']} optimizations for GPU {gpu_id}")
+                    # Set PyTorch default device
+                    torch.cuda.set_device(gpu_id)
+
             # ModelManager will auto-detect tokenizer
             # We pass None for bpe_path since load_primary_tts uses ModelManager
             # which extracts and uses the tokenizer from metadata
@@ -1055,6 +1064,13 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             )
 
         try:
+            # Apply architecture-specific optimizations for the selected GPU
+            if torch.cuda.is_available() and gpu_id < torch.cuda.device_count():
+                opt_result = GPUConfig.apply_optimal_settings(gpu_id)
+                if opt_result.get("status") == "applied":
+                    logger.info(f"Applied {opt_result['architecture']} optimizations for comparison on GPU {gpu_id}")
+                    torch.cuda.set_device(gpu_id)
+
             # Create output directory
             output_dir = os.path.join("outputs", "comparisons")
             os.makedirs(output_dir, exist_ok=True)

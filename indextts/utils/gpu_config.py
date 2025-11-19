@@ -324,11 +324,13 @@ class GPUConfig:
         Returns:
             Dictionary of applied settings
         """
+        import torch
+        import torch.backends.cudnn as cudnn
+
         if not torch.cuda.is_available():
             return {"status": "skipped", "reason": "CUDA not available"}
 
         try:
-            import torch.backends.cudnn as cudnn
 
             compute_cap = torch.cuda.get_device_capability(device_id)
             settings = GPUConfig.get_optimal_settings(compute_cap)
