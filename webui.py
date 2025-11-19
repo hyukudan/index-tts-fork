@@ -72,6 +72,12 @@ from indextts.utils.model_metadata import get_gpt_info, get_tokenizer_info
 from indextts.utils.audio_history import get_history_manager
 from indextts.utils.model_manager import ModelManager, ModelMetadata
 from indextts.utils.model_comparison import ModelComparator
+from indextts.utils.training_monitor import (
+    TensorBoardManager,
+    TrainingLogParser,
+    find_training_logs,
+    get_tensorboard_logdir
+)
 import gc
 
 def cleanup_gpu_memory():
@@ -99,6 +105,9 @@ _current_gpu_id = gpu_id
 # Initialize ModelManager for hot-swap functionality
 _model_manager = ModelManager()
 _model_comparator = ModelComparator(_model_manager)
+
+# Initialize TensorBoard manager for training monitoring
+_tensorboard_manager = TensorBoardManager()
 
 logger = logging.getLogger(__name__)
 
@@ -941,6 +950,70 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 
                 train_install_status = gr.Markdown(value="Ready to install")
 
+        # Training Monitor Tab
+        with gr.Tab("Training Monitor"):
+            gr.Markdown("""
+            ### 📊 Training Visualization & Monitoring
+
+            Monitor your training progress in real-time with TensorBoard and live metrics.
+            """)
+
+            with gr.Row():
+                with gr.Column(scale=2):
+                    # TensorBoard Controls
+                    with gr.Group():
+                        gr.Markdown("#### TensorBoard")
+
+                        with gr.Row():
+                            monitor_project_selector = gr.Dropdown(
+                                choices=[],
+                                label="Select Project",
+                                info="Choose a training project to monitor",
+                                scale=3
+                            )
+                            monitor_refresh_projects = gr.Button("🔄 Refresh", scale=1)
+
+                        with gr.Row():
+                            monitor_tb_port = gr.Number(
+                                label="TensorBoard Port",
+                                value=6006,
+                                precision=0,
+                                scale=2
+                            )
+                            monitor_tb_start = gr.Button("▶️ Start TensorBoard", variant="primary", scale=2)
+                            monitor_tb_stop = gr.Button("⏹️ Stop TensorBoard", scale=2)
+
+                        monitor_tb_status = gr.Markdown(value="⚪ TensorBoard: Not running")
+
+                        # TensorBoard iframe (hidden by default)
+                        monitor_tb_frame = gr.HTML(
+                            value="<p style='text-align: center; color: gray;'>Start TensorBoard to view</p>",
+                            label="TensorBoard"
+                        )
+
+                with gr.Column(scale=1):
+                    # Training Status
+                    with gr.Group():
+                        gr.Markdown("#### Training Status")
+                        monitor_status_display = gr.Markdown(value="No training active")
+
+                        monitor_refresh_status = gr.Button("🔄 Refresh Status")
+
+            # Live Metrics Plots
+            with gr.Accordion("📈 Live Metrics", open=True):
+                with gr.Row():
+                    with gr.Column():
+                        monitor_loss_plot = gr.Plot(label="Training Loss")
+                    with gr.Column():
+                        monitor_lr_plot = gr.Plot(label="Learning Rate")
+
+                with gr.Row():
+                    monitor_refresh_plots = gr.Button("🔄 Refresh Plots")
+                    monitor_auto_refresh = gr.Checkbox(
+                        label="Auto-refresh (every 10s)",
+                        value=False
+                    )
+
     # Handler functions
     def handle_model_selection_change(model_label, gpt_paths_mapping):
         """Update metadata displays when model selection changes."""
@@ -1413,6 +1486,202 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 - Average RTF: {stats['avg_rtf']:.3f}
 """
         return gallery_data, stats_text
+
+    # Training Monitor Handlers
+    def refresh_training_projects():
+        """Refresh list of available training projects."""
+        training_root = Path("training")
+        if not training_root.exists():
+            return gr.update(choices=[])
+
+        # Find all project directories
+        projects = []
+        for project_dir in training_root.iterdir():
+            if project_dir.is_dir():
+                # Check if it has a checkpoints directory (indicates training)
+                if (project_dir / "checkpoints").exists():
+                    projects.append(project_dir.name)
+
+        projects.sort()
+        return gr.update(choices=projects, value=projects[0] if projects else None)
+
+    def start_tensorboard(project_name, port):
+        """Start TensorBoard for the selected project."""
+        if not project_name:
+            gr.Warning("Please select a project first")
+            return (
+                "⚠️ No project selected",
+                "<p style='text-align: center; color: gray;'>Select a project and start TensorBoard</p>"
+            )
+
+        try:
+            port = int(port)
+        except (ValueError, TypeError):
+            port = 6006
+
+        logdir = get_tensorboard_logdir(project_name)
+
+        success, message = _tensorboard_manager.start(logdir, port)
+
+        if success:
+            # Create iframe HTML
+            iframe_html = f"""
+            <iframe src="{message}"
+                    width="100%"
+                    height="800px"
+                    frameborder="0">
+            </iframe>
+            """
+            status = f"🟢 TensorBoard running at [{message}]({message})"
+            gr.Info(f"TensorBoard started at {message}")
+            return status, iframe_html
+        else:
+            gr.Warning(f"Failed to start TensorBoard: {message}")
+            return (
+                f"🔴 TensorBoard failed: {message}",
+                f"<p style='text-align: center; color: red;'>Error: {message}</p>"
+            )
+
+    def stop_tensorboard():
+        """Stop TensorBoard."""
+        success, message = _tensorboard_manager.stop()
+
+        if success:
+            gr.Info("TensorBoard stopped")
+            return (
+                "⚪ TensorBoard: Not running",
+                "<p style='text-align: center; color: gray;'>TensorBoard stopped</p>"
+            )
+        else:
+            return (
+                f"⚠️ {message}",
+                "<p style='text-align: center; color: gray;'>TensorBoard not running</p>"
+            )
+
+    def refresh_training_status(project_name):
+        """Refresh training status display."""
+        if not project_name:
+            return "⚠️ No project selected"
+
+        training_root = Path("training")
+        project_dir = training_root / project_name / "checkpoints"
+
+        if not project_dir.exists():
+            return f"⚠️ Project directory not found: {project_dir}"
+
+        # Find log files
+        log_files = find_training_logs(project_name)
+
+        if not log_files:
+            return f"📂 **Project:** {project_name}\n\n⚠️ No training logs found yet.\n\nStart training to see metrics."
+
+        # Parse most recent log
+        parser = TrainingLogParser(log_files[0])
+        latest_metrics = parser.get_latest_metrics()
+
+        if not latest_metrics:
+            return f"📂 **Project:** {project_name}\n\n⚠️ No metrics parsed yet from logs."
+
+        # Format status
+        status = f"""📂 **Project:** `{project_name}`
+
+📊 **Latest Metrics:**
+- Step: {latest_metrics.step}
+- Epoch: {latest_metrics.epoch}
+- Loss: {latest_metrics.loss:.4f}
+- Learning Rate: {latest_metrics.learning_rate:.2e}
+"""
+
+        if latest_metrics.grad_norm:
+            status += f"- Grad Norm: {latest_metrics.grad_norm:.4f}\n"
+        if latest_metrics.vram_gb:
+            status += f"- VRAM: {latest_metrics.vram_gb:.1f} GB\n"
+
+        # Find latest checkpoint
+        checkpoints = list(project_dir.glob("model_step*.pth"))
+        if checkpoints:
+            latest_ckpt = max(checkpoints, key=lambda p: p.stat().st_mtime)
+            status += f"\n💾 **Latest Checkpoint:** `{latest_ckpt.name}`"
+
+        return status
+
+    def refresh_training_plots(project_name):
+        """Refresh training metric plots."""
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+
+        if not project_name:
+            # Return empty plots
+            empty_fig = go.Figure()
+            empty_fig.update_layout(
+                title="No project selected",
+                xaxis_title="Step",
+                yaxis_title="Value"
+            )
+            return empty_fig, empty_fig
+
+        # Find log files
+        log_files = find_training_logs(project_name)
+
+        if not log_files:
+            empty_fig = go.Figure()
+            empty_fig.update_layout(
+                title="No training logs found",
+                xaxis_title="Step",
+                yaxis_title="Value"
+            )
+            return empty_fig, empty_fig
+
+        # Parse log file
+        parser = TrainingLogParser(log_files[0])
+        metrics = parser.get_metrics_for_plotting()
+
+        if not metrics['steps']:
+            empty_fig = go.Figure()
+            empty_fig.update_layout(
+                title="No metrics found in logs",
+                xaxis_title="Step",
+                yaxis_title="Value"
+            )
+            return empty_fig, empty_fig
+
+        # Loss plot
+        loss_fig = go.Figure()
+        loss_fig.add_trace(go.Scatter(
+            x=metrics['steps'],
+            y=metrics['losses'],
+            mode='lines+markers',
+            name='Training Loss',
+            line=dict(color='#2563eb', width=2),
+            marker=dict(size=4)
+        ))
+        loss_fig.update_layout(
+            title=f"Training Loss - {project_name}",
+            xaxis_title="Training Step",
+            yaxis_title="Loss",
+            template="plotly_white",
+            hovermode='x unified'
+        )
+
+        # Learning rate plot
+        lr_fig = go.Figure()
+        lr_fig.add_trace(go.Scatter(
+            x=metrics['steps'],
+            y=metrics['learning_rates'],
+            mode='lines+markers',
+            name='Learning Rate',
+            line=dict(color='#16a34a', width=2),
+            marker=dict(size=4)
+        ))
+        lr_fig.update_layout(
+            title=f"Learning Rate - {project_name}",
+            xaxis_title="Training Step",
+            yaxis_title="Learning Rate",
+            template="plotly_white",
+            hovermode='x unified'
+        )
+
+        return loss_fig, lr_fig
 
     def clear_history_all():
         """Clear all history."""
@@ -2168,6 +2437,44 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             train_description
         ],
         outputs=train_install_status
+    )
+
+    # Training Monitor event handlers
+    monitor_refresh_projects.click(
+        refresh_training_projects,
+        inputs=[],
+        outputs=monitor_project_selector
+    )
+
+    monitor_tb_start.click(
+        start_tensorboard,
+        inputs=[monitor_project_selector, monitor_tb_port],
+        outputs=[monitor_tb_status, monitor_tb_frame]
+    )
+
+    monitor_tb_stop.click(
+        stop_tensorboard,
+        inputs=[],
+        outputs=[monitor_tb_status, monitor_tb_frame]
+    )
+
+    monitor_refresh_status.click(
+        refresh_training_status,
+        inputs=[monitor_project_selector],
+        outputs=monitor_status_display
+    )
+
+    monitor_refresh_plots.click(
+        refresh_training_plots,
+        inputs=[monitor_project_selector],
+        outputs=[monitor_loss_plot, monitor_lr_plot]
+    )
+
+    # Auto-load projects on tab open
+    monitor_project_selector.select(
+        refresh_training_status,
+        inputs=[monitor_project_selector],
+        outputs=monitor_status_display
     )
 
 
