@@ -191,6 +191,9 @@ def load_primary_tts(gpt_path, bpe_path=None):
     try:
         # Use ModelManager for hot-swap loading
         # If bpe_path is None, ModelManager will auto-detect tokenizer
+        logger.info(f"🔍 DEBUG load_primary_tts: About to call ModelManager.load_model with gpu_id={_current_gpu_id}")
+        logger.info(f"🔍 DEBUG load_primary_tts: torch.cuda.current_device() = {torch.cuda.current_device()}")
+
         tts = _model_manager.load_model(
             gpt_path=resolved_gpt,
             gpu_id=_current_gpu_id,
@@ -199,6 +202,8 @@ def load_primary_tts(gpt_path, bpe_path=None):
             config_path=os.path.join(cmd_args.model_dir, "config.yaml"),
             tokenizer_path=resolved_bpe  # None triggers auto-detection
         )
+
+        logger.info(f"🔍 DEBUG load_primary_tts: Model loaded successfully")
 
         # Update bpe path in selection with auto-detected tokenizer
         if bpe_path is None:
@@ -1253,22 +1258,35 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             return "⚠️ Invalid selection", get_model_status_text(), get_gpu_monitor_text()
 
         try:
+            # DEBUG: Log what GPU was selected
+            logger.info(f"🔍 DEBUG: User selected GPU ID: {gpu_id} from dropdown")
+            logger.info(f"🔍 DEBUG: Previous _current_gpu_id: {_current_gpu_id}")
+
             # Update GPU selection and re-detect GPU info
             _current_gpu_id = gpu_id
+            logger.info(f"🔍 DEBUG: Updated _current_gpu_id to: {_current_gpu_id}")
+
             # Get fresh GPU info for the selected GPU
             all_gpus = _gpu_config_manager.get_gpu_info()
+            logger.info(f"🔍 DEBUG: Total GPUs detected: {len(all_gpus)}")
+            for i, g in enumerate(all_gpus):
+                logger.info(f"🔍 DEBUG:   GPU {i}: {g['name']}")
+
             if gpu_id < len(all_gpus):
                 gpu_info = all_gpus[gpu_id]
-                logger.info(f"Switched to GPU {gpu_id}: {gpu_info['name']}")
+                logger.info(f"✅ Switched to GPU {gpu_id}: {gpu_info['name']}")
+                logger.info(f"🔍 DEBUG: gpu_info updated to: {gpu_info}")
 
             # Apply architecture-specific optimizations for the selected GPU
             # This ensures TF32, cuDNN, and other settings are optimal for the target GPU
             if torch.cuda.is_available() and gpu_id < torch.cuda.device_count():
+                logger.info(f"🔍 DEBUG: torch.cuda.current_device() BEFORE set_device: {torch.cuda.current_device()}")
                 opt_result = GPUConfig.apply_optimal_settings(gpu_id)
                 if opt_result.get("status") == "applied":
                     logger.info(f"Applied {opt_result['architecture']} optimizations for GPU {gpu_id}")
                     # Set PyTorch default device
                     torch.cuda.set_device(gpu_id)
+                    logger.info(f"🔍 DEBUG: torch.cuda.current_device() AFTER set_device: {torch.cuda.current_device()}")
 
             # ModelManager will auto-detect tokenizer
             # We pass None for bpe_path since load_primary_tts uses ModelManager

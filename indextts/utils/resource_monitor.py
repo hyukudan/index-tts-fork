@@ -55,6 +55,11 @@ class ResourceMonitor:
         self._cache_timestamp = 0.0
         self._cache_ttl = 2.0  # Cache for 2 seconds
         self._nvidia_smi_available = self._check_nvidia_smi()
+
+        # Build mapping from PyTorch device IDs to nvidia-smi indexes
+        # This is needed because PyTorch and nvidia-smi may enumerate GPUs in different orders
+        self._pytorch_to_nvidiasmi_map: Dict[int, int] = self._build_device_mapping()
+
         self._initialized = True
 
     @staticmethod
@@ -70,6 +75,94 @@ class ResourceMonitor:
             return True
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return False
+
+    def _build_device_mapping(self) -> Dict[int, int]:
+        """
+        Build mapping from PyTorch device IDs to nvidia-smi indexes using GPU UUIDs.
+
+        PyTorch and nvidia-smi may enumerate GPUs in different orders.
+        We use GPU UUIDs as a stable identifier to create the correct mapping.
+
+        Returns:
+            Dictionary mapping PyTorch device ID to nvidia-smi index
+        """
+        mapping = {}
+
+        if not TORCH_AVAILABLE or not torch.cuda.is_available():
+            return mapping
+
+        if not self._nvidia_smi_available:
+            # If nvidia-smi isn't available, assume 1:1 mapping
+            for i in range(torch.cuda.device_count()):
+                mapping[i] = i
+            return mapping
+
+        try:
+            # Get UUID mapping from nvidia-smi
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=index,uuid,name", "--format=csv,noheader"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+
+            if result.returncode != 0:
+                # Fallback to 1:1 mapping
+                for i in range(torch.cuda.device_count()):
+                    mapping[i] = i
+                return mapping
+
+            # Parse nvidia-smi output to build UUID -> smi_index mapping
+            nvidiasmi_uuid_to_index = {}
+            for line in result.stdout.strip().split('\n'):
+                parts = [p.strip() for p in line.split(',')]
+                if len(parts) >= 2:
+                    smi_index = int(parts[0])
+                    uuid = parts[1]
+                    nvidiasmi_uuid_to_index[uuid] = smi_index
+
+            # Get UUID for each PyTorch device using nvidia-smi -L
+            result_list = subprocess.run(
+                ["nvidia-smi", "-L"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+
+            if result_list.returncode != 0:
+                # Fallback to 1:1 mapping
+                for i in range(torch.cuda.device_count()):
+                    mapping[i] = i
+                return mapping
+
+            # Match PyTorch device names with nvidia-smi -L output to get UUIDs
+            import re
+            for pytorch_id in range(torch.cuda.device_count()):
+                pytorch_name = torch.cuda.get_device_name(pytorch_id)
+
+                # Find this GPU in nvidia-smi -L output
+                for line in result_list.stdout.strip().split('\n'):
+                    if pytorch_name in line:
+                        # Extract UUID from line like: "GPU 0: ... (UUID: GPU-xxx)"
+                        match = re.search(r'UUID: (GPU-[\w-]+)', line)
+                        if match:
+                            uuid = match.group(1)
+                            if uuid in nvidiasmi_uuid_to_index:
+                                mapping[pytorch_id] = nvidiasmi_uuid_to_index[uuid]
+                                break
+
+            # If we didn't get a complete mapping, fallback to 1:1
+            if len(mapping) != torch.cuda.device_count():
+                mapping.clear()
+                for i in range(torch.cuda.device_count()):
+                    mapping[i] = i
+
+        except Exception:
+            # On any error, use 1:1 mapping as fallback
+            for i in range(torch.cuda.device_count()):
+                mapping[i] = i
+
+        return mapping
 
     def get_gpu_stats(self, device_id: int = 0) -> Optional[GPUStats]:
         """
@@ -138,6 +231,9 @@ class ResourceMonitor:
 
     def _parse_nvidia_smi_output(self, output: str):
         """Parse nvidia-smi CSV output."""
+        # Invert the mapping: nvidia-smi index -> PyTorch device ID
+        nvidiasmi_to_pytorch = {smi_idx: pytorch_id for pytorch_id, smi_idx in self._pytorch_to_nvidiasmi_map.items()}
+
         for line in output.strip().split('\n'):
             if not line.strip():
                 continue
@@ -147,7 +243,7 @@ class ResourceMonitor:
                 continue
 
             try:
-                device_id = int(parts[0])
+                nvidiasmi_index = int(parts[0])  # This is nvidia-smi's index
                 name = parts[1]
                 temp = int(parts[2]) if parts[2] and parts[2] != 'N/A' else None
                 mem_used = int(float(parts[3]))  # Handle decimal values
@@ -158,8 +254,12 @@ class ResourceMonitor:
 
                 mem_percent = (mem_used / mem_total * 100) if mem_total > 0 else 0.0
 
-                self._cache[device_id] = GPUStats(
-                    device_id=device_id,
+                # Convert nvidia-smi index to PyTorch device ID
+                pytorch_device_id = nvidiasmi_to_pytorch.get(nvidiasmi_index, nvidiasmi_index)
+
+                # Store stats using PyTorch device ID as the key
+                self._cache[pytorch_device_id] = GPUStats(
+                    device_id=pytorch_device_id,  # Use PyTorch device ID
                     name=name,
                     temperature=temp,
                     memory_used=mem_used,
