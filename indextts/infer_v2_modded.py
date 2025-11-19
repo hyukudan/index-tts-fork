@@ -1,6 +1,6 @@
 import os
 from subprocess import CalledProcessError
-from typing import Optional
+from typing import Optional, List
 
 os.environ['HF_HUB_CACHE'] = './checkpoints/hf_cache'
 import json
