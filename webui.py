@@ -147,26 +147,33 @@ def dispose_primary_tts():
     _model_manager.unload_current_model()
 
 
-def load_primary_tts(gpt_path, bpe_path):
+def load_primary_tts(gpt_path, bpe_path=None):
     """Load TTS with specified model paths using ModelManager."""
     global _PRIMARY_TTS
 
     resolved_gpt = os.path.abspath(gpt_path)
-    resolved_bpe = os.path.abspath(bpe_path)
+    resolved_bpe = os.path.abspath(bpe_path) if bpe_path else None
     previous_selection = _MODEL_SELECTION.copy()
     _MODEL_SELECTION["gpt"] = resolved_gpt
     _MODEL_SELECTION["bpe"] = resolved_bpe
 
     try:
         # Use ModelManager for hot-swap loading
+        # If bpe_path is None, ModelManager will auto-detect tokenizer
         tts = _model_manager.load_model(
             gpt_path=resolved_gpt,
             gpu_id=_current_gpu_id,
             use_fp16=cmd_args.is_fp16,
             use_cuda_kernel=False,
             config_path=os.path.join(cmd_args.model_dir, "config.yaml"),
-            tokenizer_path=resolved_bpe
+            tokenizer_path=resolved_bpe  # None triggers auto-detection
         )
+
+        # Update bpe path in selection with auto-detected tokenizer
+        if bpe_path is None:
+            metadata = _model_manager.get_current_metadata()
+            if metadata and metadata.tokenizer_path:
+                _MODEL_SELECTION["bpe"] = metadata.tokenizer_path
     except Exception:
         _MODEL_SELECTION.update(previous_selection)
         raise
@@ -239,6 +246,65 @@ def get_gpu_monitor_text():
         lines.append(f"⚠️ OOM Risk: {risk.upper()}")
 
     return "\n".join(lines)
+
+
+def get_model_choices_with_metadata():
+    """Get model choices with metadata for dropdown."""
+    gpt_checkpoints = _discover_gpt_checkpoints()
+    choices = []
+
+    for gpt_path in gpt_checkpoints:
+        try:
+            metadata = _model_manager.extract_model_metadata(gpt_path)
+            label = f"{metadata.filename} ({metadata.size_mb/1024:.1f}GB, v{metadata.version}, {'/'.join(metadata.languages)})"
+            choices.append((label, gpt_path))
+        except:
+            choices.append((Path(gpt_path).name, gpt_path))
+
+    return choices
+
+
+def get_model_info_display(gpt_path):
+    """Get formatted model information for display."""
+    if not gpt_path:
+        return "No model selected", "Select a model to see VRAM estimate"
+
+    try:
+        metadata = _model_manager.extract_model_metadata(gpt_path)
+
+        # Auto-detected tokenizer
+        tokenizer_info = f"**Auto-detected:** {Path(metadata.tokenizer_path).name if metadata.tokenizer_path else 'None'}"
+        if metadata.tokenizer_path:
+            tokenizer_info += f" ({metadata.vocab_size} vocab)"
+
+        # VRAM estimate with color coding
+        vram_gb = metadata.recommended_vram_gb
+        if vram_gb < 12:
+            vram_emoji = "🟢"
+        elif vram_gb < 20:
+            vram_emoji = "🟡"
+        else:
+            vram_emoji = "🔴"
+
+        vram_info = f"{vram_emoji} **Estimated VRAM:** {vram_gb:.1f} GB"
+
+        return tokenizer_info, vram_info
+
+    except Exception as e:
+        logger.warning(f"Failed to get model info: {e}")
+        return "Error loading metadata", "VRAM estimate unavailable"
+
+
+def get_gpu_selector_choices():
+    """Get GPU choices for selector."""
+    gpus = _gpu_config_manager.detect_gpus()
+    choices = []
+
+    for gpu in gpus:
+        label = f"GPU {gpu['id']}: {gpu['name']} ({gpu['memory_gb']:.1f} GB)"
+        choices.append((label, gpu['id']))
+
+    return choices
 
 
 # 支持的语言列表
@@ -397,26 +463,46 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 
     # Model and GPU Configuration
     with gr.Accordion("Model & GPU Configuration", open=True):
-        # Model selection
+        # GPU selection
+        with gr.Row():
+            gpu_choices = get_gpu_selector_choices()
+            gpu_dropdown = gr.Dropdown(
+                choices=gpu_choices,
+                value=gpu_choices[0][1] if gpu_choices else 0,
+                label="GPU Device",
+                interactive=True,
+                scale=2,
+                info="Select GPU for model inference"
+            )
+
+        # Model selection with metadata
         with gr.Row():
             gpt_checkpoints = _discover_gpt_checkpoints()
-            bpe_models = _discover_bpe_models()
+            model_choices_with_metadata = get_model_choices_with_metadata()
 
             gpt_dropdown = gr.Dropdown(
-                choices=[Path(p).name for p in gpt_checkpoints],
-                value=Path(gpt_checkpoints[0]).name if gpt_checkpoints else None,
-                label="GPT Checkpoint (.pth)",
+                choices=[choice[0] for choice in model_choices_with_metadata],
+                value=model_choices_with_metadata[0][0] if model_choices_with_metadata else None,
+                label="Model Checkpoint",
                 interactive=True,
-                scale=2
+                scale=3,
+                info="Select TTS model (tokenizer auto-detected)"
             )
-            bpe_dropdown = gr.Dropdown(
-                choices=[Path(p).name for p in bpe_models],
-                value=Path(bpe_models[0]).name if bpe_models else None,
-                label="BPE Tokenizer (.model)",
-                interactive=True,
-                scale=2
-            )
-            load_models_button = gr.Button("Load Models", variant="primary", scale=1)
+            load_models_button = gr.Button("Load Model", variant="primary", scale=1)
+
+        # Model metadata display
+        # Get initial metadata for default model
+        initial_tokenizer_info = "**Tokenizer:** Select a model to see info"
+        initial_vram_info = "**VRAM:** Select a model to see estimate"
+        if model_choices_with_metadata:
+            default_model_path = model_choices_with_metadata[0][1]
+            initial_tokenizer_info, initial_vram_info = get_model_info_display(default_model_path)
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                tokenizer_info_display = gr.Markdown(value=initial_tokenizer_info)
+            with gr.Column(scale=1):
+                vram_info_display = gr.Markdown(value=initial_vram_info)
 
         model_status = gr.Markdown(value="✅ Default models loaded" if tts else "⚠️ No models loaded")
 
@@ -425,9 +511,8 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             gpu_monitor_display = gr.Markdown(value=get_gpu_monitor_text())
             refresh_monitor_button = gr.Button("Refresh GPU Stats", variant="secondary", size="sm")
 
-        # State for model paths
-        gpt_paths_state = gr.State(gpt_checkpoints)
-        bpe_paths_state = gr.State(bpe_models)
+        # State for model paths (mapping from display labels to actual paths)
+        gpt_paths_state = gr.State({choice[0]: choice[1] for choice in model_choices_with_metadata})
 
     with gr.Accordion("Emotion Settings", open=True):
         with gr.Row():
@@ -578,28 +663,261 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                 clear_history_button = gr.Button("Clear All History", variant="stop")
             history_stats = gr.Markdown(value="No generations yet.")
 
-    # Handler functions
-    def handle_model_load(gpt_label, bpe_label, gpt_paths, bpe_paths):
-        """Load selected models."""
-        gpt_path = next((p for p in gpt_paths if Path(p).name == gpt_label), None)
-        bpe_path = next((p for p in bpe_paths if Path(p).name == bpe_label), None)
+        with gr.Tab("Compare Models"):
+            gr.Markdown("Generate audio with two different models using the same prompt for side-by-side comparison.")
 
-        if not gpt_path or not bpe_path:
-            gr.Warning("Select both GPT and BPE models.")
+            # Model selection for comparison
+            with gr.Row():
+                with gr.Column(scale=1):
+                    compare_model_a_dropdown = gr.Dropdown(
+                        choices=[choice[0] for choice in model_choices_with_metadata],
+                        value=model_choices_with_metadata[0][0] if len(model_choices_with_metadata) > 0 else None,
+                        label="Model A",
+                        interactive=True,
+                        info="First model for comparison"
+                    )
+                    compare_model_a_info = gr.Markdown(value="Select Model A")
+
+                with gr.Column(scale=1):
+                    compare_model_b_dropdown = gr.Dropdown(
+                        choices=[choice[0] for choice in model_choices_with_metadata],
+                        value=model_choices_with_metadata[1][0] if len(model_choices_with_metadata) > 1 else None,
+                        label="Model B",
+                        interactive=True,
+                        info="Second model for comparison"
+                    )
+                    compare_model_b_info = gr.Markdown(value="Select Model B")
+
+            # Comparison inputs
+            with gr.Row():
+                with gr.Column(scale=1):
+                    compare_prompt_audio = gr.Audio(
+                        label="Voice Prompt",
+                        sources=["upload", "microphone"],
+                        type="filepath"
+                    )
+                with gr.Column(scale=2):
+                    compare_text = gr.TextArea(
+                        label="Text to Synthesize",
+                        placeholder="Enter the same text for both models",
+                        lines=3
+                    )
+
+            # Generate button and GPU selector
+            with gr.Row():
+                compare_gpu_dropdown = gr.Dropdown(
+                    choices=gpu_choices,
+                    value=gpu_choices[0][1] if gpu_choices else 0,
+                    label="GPU for Comparison",
+                    interactive=True,
+                    scale=2
+                )
+                compare_generate_button = gr.Button(
+                    "Generate with Both Models",
+                    variant="primary",
+                    scale=1
+                )
+
+            # Status and progress
+            compare_status = gr.Markdown(value="Ready to compare models")
+
+            # Results: Side-by-side audio players
+            gr.Markdown("### Results")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    gr.Markdown("**Model A Output**")
+                    compare_audio_a = gr.Audio(label="Generated Audio A", visible=False)
+                with gr.Column(scale=1):
+                    gr.Markdown("**Model B Output**")
+                    compare_audio_b = gr.Audio(label="Generated Audio B", visible=False)
+
+            # Waveform comparison visualization
+            compare_waveform_image = gr.Image(
+                label="Waveform Comparison",
+                visible=False,
+                type="filepath"
+            )
+
+            # Metrics comparison table
+            compare_metrics_display = gr.Markdown(
+                value="",
+                visible=False
+            )
+
+    # Handler functions
+    def handle_model_selection_change(model_label, gpt_paths_mapping):
+        """Update metadata displays when model selection changes."""
+        if not model_label or not gpt_paths_mapping:
+            return "**Tokenizer:** No model selected", "**VRAM:** No model selected"
+
+        gpt_path = gpt_paths_mapping.get(model_label)
+        if not gpt_path:
+            return "**Tokenizer:** Invalid selection", "**VRAM:** Invalid selection"
+
+        tokenizer_info, vram_info = get_model_info_display(gpt_path)
+        return tokenizer_info, vram_info
+
+    def handle_model_load(model_label, gpu_id, gpt_paths_mapping):
+        """Load selected model with specified GPU."""
+        global _current_gpu_id
+
+        if not model_label or not gpt_paths_mapping:
+            gr.Warning("Select a model first.")
+            return "⚠️ No model selected"
+
+        gpt_path = gpt_paths_mapping.get(model_label)
+        if not gpt_path:
+            gr.Warning("Invalid model selection.")
             return "⚠️ Invalid selection"
 
         try:
-            load_primary_tts(gpt_path, bpe_path)
-            gr.Info("Models loaded successfully!")
-            return f"✅ Loaded: **{gpt_label}** | **{bpe_label}**"
+            # Update GPU selection
+            _current_gpu_id = gpu_id
+
+            # ModelManager will auto-detect tokenizer
+            # We pass None for bpe_path since load_primary_tts uses ModelManager
+            # which extracts and uses the tokenizer from metadata
+            load_primary_tts(gpt_path, None)
+
+            metadata = _model_manager.get_current_metadata()
+            tokenizer_name = Path(metadata.tokenizer_path).name if metadata.tokenizer_path else "None"
+
+            gr.Info(f"Model loaded successfully on GPU {gpu_id}!")
+            return f"✅ Loaded: **{metadata.filename}** on GPU {gpu_id} | Tokenizer: **{tokenizer_name}**"
         except Exception as e:
-            logger.exception("Failed to load models")
-            gr.Warning(f"Failed to load models: {e}")
+            logger.exception("Failed to load model")
+            gr.Warning(f"Failed to load model: {e}")
             return f"❌ Load failed: {e}"
 
     def refresh_monitor():
         """Refresh GPU monitor."""
         return get_gpu_monitor_text()
+
+    def handle_compare_model_info_update(model_label, gpt_paths_mapping):
+        """Update model info display for comparison."""
+        if not model_label or not gpt_paths_mapping:
+            return "Select a model"
+
+        gpt_path = gpt_paths_mapping.get(model_label)
+        if not gpt_path:
+            return "Invalid model"
+
+        try:
+            metadata = _model_manager.extract_model_metadata(gpt_path)
+            info = f"**{metadata.filename}**\n"
+            info += f"Size: {metadata.size_mb/1024:.1f} GB | "
+            info += f"Version: {metadata.version} | "
+            info += f"VRAM: ~{metadata.recommended_vram_gb:.1f} GB"
+            return info
+        except Exception as e:
+            logger.warning(f"Failed to get model info: {e}")
+            return "Error loading metadata"
+
+    def handle_compare_generate(
+        model_a_label, model_b_label, text, prompt_audio, gpu_id, gpt_paths_mapping
+    ):
+        """Generate audio with both models and return comparison results."""
+        import os
+        from datetime import datetime
+
+        # Validate inputs
+        if not model_a_label or not model_b_label:
+            gr.Warning("Please select both Model A and Model B")
+            return (
+                "⚠️ Please select both models",
+                gr.update(visible=False), gr.update(visible=False),
+                gr.update(visible=False), gr.update(visible=False)
+            )
+
+        if not text or not prompt_audio:
+            gr.Warning("Please provide both text and voice prompt")
+            return (
+                "⚠️ Please provide text and voice prompt",
+                gr.update(visible=False), gr.update(visible=False),
+                gr.update(visible=False), gr.update(visible=False)
+            )
+
+        if model_a_label == model_b_label:
+            gr.Warning("Please select different models for comparison")
+            return (
+                "⚠️ Please select different models",
+                gr.update(visible=False), gr.update(visible=False),
+                gr.update(visible=False), gr.update(visible=False)
+            )
+
+        # Get model paths
+        model_a_path = gpt_paths_mapping.get(model_a_label)
+        model_b_path = gpt_paths_mapping.get(model_b_label)
+
+        if not model_a_path or not model_b_path:
+            gr.Warning("Invalid model selection")
+            return (
+                "⚠️ Invalid model selection",
+                gr.update(visible=False), gr.update(visible=False),
+                gr.update(visible=False), gr.update(visible=False)
+            )
+
+        try:
+            # Create output directory
+            output_dir = os.path.join("outputs", "comparisons")
+            os.makedirs(output_dir, exist_ok=True)
+
+            # Run comparison
+            gr.Info(f"Comparing {Path(model_a_path).name} vs {Path(model_b_path).name}...")
+
+            result = _model_comparator.compare_models(
+                model_a_path=model_a_path,
+                model_b_path=model_b_path,
+                text=text,
+                prompt_audio=prompt_audio,
+                output_dir=output_dir,
+                gpu_id=gpu_id,
+                use_fp16=cmd_args.is_fp16
+            )
+
+            # Generate waveform comparison
+            waveform_path = os.path.join(output_dir, f"waveform_{result.timestamp}.png")
+            _model_comparator.generate_waveform_comparison(
+                result.audio_a_path,
+                result.audio_b_path,
+                output_path=waveform_path
+            )
+
+            # Format metrics table
+            metrics_table = _model_comparator.format_metrics_table(result)
+
+            # Prepare status message
+            status = f"""✅ Comparison completed!
+
+**Model A:** {result.model_a_metrics.model_name}
+- RTF: {result.model_a_metrics.rtf:.3f}
+- Total Time: {result.model_a_metrics.total_time:.2f}s
+- VRAM: {result.model_a_metrics.vram_peak_gb:.2f} GB
+
+**Model B:** {result.model_b_metrics.model_name}
+- RTF: {result.model_b_metrics.rtf:.3f}
+- Total Time: {result.model_b_metrics.total_time:.2f}s
+- VRAM: {result.model_b_metrics.vram_peak_gb:.2f} GB
+"""
+
+            gr.Info("Comparison completed successfully!")
+
+            return (
+                status,
+                gr.update(value=result.audio_a_path, visible=True),
+                gr.update(value=result.audio_b_path, visible=True),
+                gr.update(value=waveform_path, visible=True),
+                gr.update(value=metrics_table, visible=True)
+            )
+
+        except Exception as e:
+            logger.exception("Comparison failed")
+            gr.Warning(f"Comparison failed: {e}")
+            return (
+                f"❌ Comparison failed: {e}",
+                gr.update(visible=False), gr.update(visible=False),
+                gr.update(visible=False), gr.update(visible=False)
+            )
 
     def refresh_history_gallery():
         """Refresh history gallery."""
@@ -1253,9 +1571,16 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
     )
 
     # Model and GPU configuration handlers
+    # Update metadata displays when model selection changes
+    gpt_dropdown.change(
+        handle_model_selection_change,
+        inputs=[gpt_dropdown, gpt_paths_state],
+        outputs=[tokenizer_info_display, vram_info_display]
+    )
+
     load_models_button.click(
         handle_model_load,
-        inputs=[gpt_dropdown, bpe_dropdown, gpt_paths_state, bpe_paths_state],
+        inputs=[gpt_dropdown, gpu_dropdown, gpt_paths_state],
         outputs=model_status
     )
 
@@ -1276,6 +1601,38 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         clear_history_all,
         inputs=[],
         outputs=[history_gallery, history_stats]
+    )
+
+    # Compare Models tab handlers
+    compare_model_a_dropdown.change(
+        handle_compare_model_info_update,
+        inputs=[compare_model_a_dropdown, gpt_paths_state],
+        outputs=compare_model_a_info
+    )
+
+    compare_model_b_dropdown.change(
+        handle_compare_model_info_update,
+        inputs=[compare_model_b_dropdown, gpt_paths_state],
+        outputs=compare_model_b_info
+    )
+
+    compare_generate_button.click(
+        handle_compare_generate,
+        inputs=[
+            compare_model_a_dropdown,
+            compare_model_b_dropdown,
+            compare_text,
+            compare_prompt_audio,
+            compare_gpu_dropdown,
+            gpt_paths_state
+        ],
+        outputs=[
+            compare_status,
+            compare_audio_a,
+            compare_audio_b,
+            compare_waveform_image,
+            compare_metrics_display
+        ]
     )
 
 
