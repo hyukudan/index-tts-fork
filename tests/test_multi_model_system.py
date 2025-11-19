@@ -123,6 +123,57 @@ def test_model_comparator():
         return False
 
 
+def test_model_persistence():
+    """Test model persistence features (mark_activity, get_status, etc)."""
+    print("\nTesting model persistence features...")
+
+    from indextts.utils.model_manager import ModelManager
+    import time
+
+    try:
+        # Test with auto-unload disabled (default)
+        manager = ModelManager()
+
+        # Test get_status with no model loaded
+        status = manager.get_status()
+        assert status['model_loaded'] == False, "Model should not be loaded initially"
+        assert status['idle_time_seconds'] is None, "Idle time should be None when no model loaded"
+        print("✓ get_status() works with no model loaded")
+
+        # Test get_idle_time
+        idle_time = manager.get_idle_time()
+        assert idle_time is None, "Idle time should be None when no model loaded"
+        print("✓ get_idle_time() returns None when no model loaded")
+
+        # Test mark_activity (should be no-op when no model loaded)
+        manager.mark_activity()
+        print("✓ mark_activity() works when no model loaded")
+
+        # Test VRAM warning
+        warning = manager.get_vram_warning()
+        # Warning could be None or a string depending on VRAM usage
+        print(f"✓ get_vram_warning() works: {warning if warning else 'No warning'}")
+
+        # Test auto-unload manager
+        manager_auto = ModelManager(auto_unload_timeout=10)
+        auto_status = manager_auto.get_status()
+        assert auto_status['auto_unload_enabled'] == True, "Auto-unload should be enabled"
+        assert auto_status['auto_unload_timeout'] == 10, "Auto-unload timeout should be 10s"
+        print("✓ Auto-unload configuration works")
+
+        # Test check_auto_unload (should return False when no model loaded)
+        unloaded = manager_auto.check_auto_unload()
+        assert unloaded == False, "Should not unload when no model is loaded"
+        print("✓ check_auto_unload() returns False when no model loaded")
+
+        return True
+    except Exception as e:
+        print(f"✗ Model persistence test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Multi-Model System Test Suite")
@@ -133,6 +184,7 @@ if __name__ == "__main__":
         ("ModelManager Basic", test_model_manager),
         ("Metadata Extraction", test_model_metadata_extraction),
         ("ModelComparator Init", test_model_comparator),
+        ("Model Persistence", test_model_persistence),
     ]
 
     results = []

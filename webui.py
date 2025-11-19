@@ -262,6 +262,52 @@ def get_gpu_monitor_text():
     return "\n".join(lines)
 
 
+def get_model_status_text():
+    """Get formatted model status with persistence info."""
+    status = _model_manager.get_status()
+
+    if not status['model_loaded']:
+        return "⚪ **Model Status:** No model loaded"
+
+    lines = [f"🟢 **Model Loaded:** {status['model_name']}"]
+
+    # Languages
+    if status['languages']:
+        lines.append(f"🌍 Languages: {', '.join(status['languages'])}")
+
+    # Idle time
+    if status['idle_time_formatted']:
+        idle_emoji = "⏱️" if status.get('idle_time_seconds', 0) < 300 else "💤"
+        lines.append(f"{idle_emoji} Idle: {status['idle_time_formatted']}")
+
+    # Auto-unload status
+    if status['auto_unload_enabled']:
+        lines.append(f"⏰ Auto-unload: {status['auto_unload_timeout']}s")
+
+    # VRAM warning if applicable
+    warning = _model_manager.get_vram_warning()
+    if warning:
+        lines.append(warning)
+
+    return "\n".join(lines)
+
+
+def unload_model_handler():
+    """Handler for manual model unload button."""
+    success = _model_manager.unload_current_model()
+    if success:
+        return "✅ Model unloaded successfully", get_model_status_text(), get_gpu_monitor_text()
+    else:
+        return "⚠️ No model was loaded", get_model_status_text(), get_gpu_monitor_text()
+
+
+def refresh_status_handler():
+    """Refresh both model and GPU status."""
+    # Check auto-unload
+    _model_manager.check_auto_unload()
+    return get_model_status_text(), get_gpu_monitor_text()
+
+
 def get_model_choices_with_metadata():
     """Get model choices with metadata for dropdown."""
     gpt_checkpoints = _discover_gpt_checkpoints()
@@ -458,6 +504,9 @@ def gen_single(emo_control_method,prompt, text,
     except Exception as e:
         logger.warning(f"Failed to save to history: {e}")
 
+    # Mark model activity for persistence tracking
+    _model_manager.mark_activity()
+
     return gr.update(value=output,visible=True)
 
 def update_prompt_audio():
@@ -520,10 +569,17 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 
         model_status = gr.Markdown(value="✅ Default models loaded" if tts else "⚠️ No models loaded")
 
-        # GPU monitoring
+        # Model persistence status and controls
         with gr.Row():
-            gpu_monitor_display = gr.Markdown(value=get_gpu_monitor_text())
-            refresh_monitor_button = gr.Button("Refresh GPU Stats", variant="secondary", size="sm")
+            with gr.Column(scale=2):
+                model_status_display = gr.Markdown(value=get_model_status_text(), label="Model Status")
+            with gr.Column(scale=2):
+                gpu_monitor_display = gr.Markdown(value=get_gpu_monitor_text(), label="GPU Monitor")
+            with gr.Column(scale=1):
+                with gr.Row():
+                    unload_model_button = gr.Button("🗑️ Unload Model", variant="secondary", size="sm")
+                with gr.Row():
+                    refresh_status_button = gr.Button("🔄 Refresh Status", variant="secondary", size="sm")
 
         # State for model paths (mapping from display labels to actual paths)
         gpt_paths_state = gr.State({choice[0]: choice[1] for choice in model_choices_with_metadata})
@@ -2569,10 +2625,18 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         outputs=model_status
     )
 
-    refresh_monitor_button.click(
-        refresh_monitor,
+    # Unload model button
+    unload_model_button.click(
+        unload_model_handler,
         inputs=[],
-        outputs=gpu_monitor_display
+        outputs=[model_status, model_status_display, gpu_monitor_display]
+    )
+
+    # Refresh status button (replaces old refresh_monitor_button)
+    refresh_status_button.click(
+        refresh_status_handler,
+        inputs=[],
+        outputs=[model_status_display, gpu_monitor_display]
     )
 
     # History handlers

@@ -62,16 +62,19 @@ class ModelManager:
     - Tokenizer auto-detection
     """
 
-    def __init__(self, registry_path: Optional[str] = None):
+    def __init__(self, registry_path: Optional[str] = None, auto_unload_timeout: Optional[int] = None):
         """
         Initialize the Model Manager.
 
         Args:
             registry_path: Path to model registry JSON. Defaults to ~/.indextts/model_registry.json
+            auto_unload_timeout: Optional timeout in seconds for auto-unload (None = disabled)
         """
         self.current_model: Optional[IndexTTS2] = None
         self.current_model_path: Optional[str] = None
         self.current_metadata: Optional[ModelMetadata] = None
+        self.last_activity_time: Optional[float] = None
+        self.auto_unload_timeout = auto_unload_timeout
 
         # Registry for model metadata
         if registry_path is None:
@@ -83,6 +86,8 @@ class ModelManager:
         self.registry: Dict[str, ModelMetadata] = self._load_registry()
 
         logger.info(f"ModelManager initialized. Registry: {self.registry_path}")
+        if auto_unload_timeout:
+            logger.info(f"Auto-unload enabled: {auto_unload_timeout}s timeout")
 
     def _load_registry(self) -> Dict[str, ModelMetadata]:
         """Load model registry from disk."""
@@ -266,6 +271,7 @@ class ModelManager:
         self.current_model = None
         self.current_model_path = None
         self.current_metadata = None
+        self.last_activity_time = None
 
         # Aggressive garbage collection
         gc.collect()
@@ -361,6 +367,7 @@ class ModelManager:
             self.current_model = model
             self.current_model_path = gpt_path
             self.current_metadata = metadata
+            self.last_activity_time = time.time()
 
             # Save updated registry
             self._save_registry()
@@ -406,3 +413,98 @@ class ModelManager:
             'free_gb': free,
             'total_gb': total
         }
+
+    def mark_activity(self):
+        """Mark current time as last activity (e.g., after generation)."""
+        if self.current_model is not None:
+            self.last_activity_time = time.time()
+            logger.debug(f"Activity marked for {self.current_metadata.filename}")
+
+    def get_idle_time(self) -> Optional[float]:
+        """
+        Get seconds since last activity.
+
+        Returns:
+            Idle time in seconds, or None if no model is loaded
+        """
+        if self.last_activity_time is None:
+            return None
+        return time.time() - self.last_activity_time
+
+    def check_auto_unload(self) -> bool:
+        """
+        Check if model should be auto-unloaded due to timeout.
+
+        Returns:
+            True if model was unloaded, False otherwise
+        """
+        if self.auto_unload_timeout is None or self.current_model is None:
+            return False
+
+        idle_time = self.get_idle_time()
+        if idle_time and idle_time > self.auto_unload_timeout:
+            logger.info(f"Auto-unloading model after {idle_time:.0f}s idle time")
+            self.unload_current_model()
+            return True
+
+        return False
+
+    def get_status(self) -> Dict[str, Any]:
+        """
+        Get comprehensive status of the model manager.
+
+        Returns:
+            Dictionary with model status, memory usage, and activity info
+        """
+        memory = self.get_memory_usage()
+        idle_time = self.get_idle_time()
+
+        status = {
+            'model_loaded': self.current_model is not None,
+            'model_name': self.current_metadata.filename if self.current_metadata else None,
+            'model_path': self.current_model_path,
+            'languages': self.current_metadata.languages if self.current_metadata else [],
+            'vram_allocated_gb': memory['allocated_gb'],
+            'vram_reserved_gb': memory['reserved_gb'],
+            'vram_free_gb': memory['free_gb'],
+            'vram_total_gb': memory.get('total_gb', 0),
+            'vram_usage_pct': (memory['reserved_gb'] / memory.get('total_gb', 1)) * 100 if memory.get('total_gb', 0) > 0 else 0,
+            'idle_time_seconds': idle_time,
+            'idle_time_formatted': self._format_time(idle_time) if idle_time else None,
+            'auto_unload_enabled': self.auto_unload_timeout is not None,
+            'auto_unload_timeout': self.auto_unload_timeout,
+        }
+
+        return status
+
+    def get_vram_warning(self) -> Optional[str]:
+        """
+        Get VRAM usage warning if usage is high.
+
+        Returns:
+            Warning message if VRAM > 90%, None otherwise
+        """
+        status = self.get_status()
+        usage_pct = status['vram_usage_pct']
+
+        if usage_pct > 95:
+            return f"⚠️ CRITICAL: VRAM usage at {usage_pct:.1f}%. Consider unloading the model."
+        elif usage_pct > 90:
+            return f"⚠️ WARNING: VRAM usage at {usage_pct:.1f}%. High memory pressure."
+        elif usage_pct > 80:
+            return f"ℹ️ INFO: VRAM usage at {usage_pct:.1f}%. Memory usage is elevated."
+
+        return None
+
+    @staticmethod
+    def _format_time(seconds: Optional[float]) -> str:
+        """Format seconds into human-readable time."""
+        if seconds is None:
+            return "N/A"
+
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        elif seconds < 3600:
+            return f"{seconds/60:.1f}m"
+        else:
+            return f"{seconds/3600:.1f}h"
