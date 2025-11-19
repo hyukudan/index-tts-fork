@@ -70,6 +70,8 @@ from indextts.utils.gpu_config import setup_gpu, GPUConfig
 from indextts.utils.resource_monitor import get_monitor, format_vram_bar
 from indextts.utils.model_metadata import get_gpt_info, get_tokenizer_info
 from indextts.utils.audio_history import get_history_manager
+from indextts.utils.model_manager import ModelManager, ModelMetadata
+from indextts.utils.model_comparison import ModelComparator
 import gc
 
 def cleanup_gpu_memory():
@@ -93,6 +95,10 @@ _PRIMARY_TTS = None
 _MODEL_SELECTION = {"gpt": None, "bpe": None}
 _gpu_config_manager = GPUConfig()
 _current_gpu_id = gpu_id
+
+# Initialize ModelManager for hot-swap functionality
+_model_manager = ModelManager()
+_model_comparator = ModelComparator(_model_manager)
 
 logger = logging.getLogger(__name__)
 
@@ -136,14 +142,15 @@ def dispose_primary_tts():
                 _PRIMARY_TTS.gr_progress = None
         finally:
             _PRIMARY_TTS = None
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+
+    # Use ModelManager to unload current model
+    _model_manager.unload_current_model()
 
 
 def load_primary_tts(gpt_path, bpe_path):
-    """Load TTS with specified model paths."""
-    dispose_primary_tts()
+    """Load TTS with specified model paths using ModelManager."""
+    global _PRIMARY_TTS
+
     resolved_gpt = os.path.abspath(gpt_path)
     resolved_bpe = os.path.abspath(bpe_path)
     previous_selection = _MODEL_SELECTION.copy()
@@ -151,20 +158,20 @@ def load_primary_tts(gpt_path, bpe_path):
     _MODEL_SELECTION["bpe"] = resolved_bpe
 
     try:
-        tts = IndexTTS2(
-            model_dir=cmd_args.model_dir,
-            cfg_path=os.path.join(cmd_args.model_dir, "config.yaml"),
-            is_fp16=cmd_args.is_fp16,
+        # Use ModelManager for hot-swap loading
+        tts = _model_manager.load_model(
+            gpt_path=resolved_gpt,
+            gpu_id=_current_gpu_id,
+            use_fp16=cmd_args.is_fp16,
             use_cuda_kernel=False,
-            gpt_checkpoint_path=resolved_gpt,
-            bpe_model_path=resolved_bpe,
+            config_path=os.path.join(cmd_args.model_dir, "config.yaml"),
+            tokenizer_path=resolved_bpe
         )
     except Exception:
         _MODEL_SELECTION.update(previous_selection)
-        dispose_primary_tts()
         raise
 
-    global _PRIMARY_TTS
+    # Keep reference for compatibility with existing code
     _PRIMARY_TTS = tts
     return tts
 
@@ -177,14 +184,22 @@ def ensure_primary_tts():
 
 
 def get_tts():
-    """Get current TTS instance or load default."""
+    """Get current TTS instance or load default using ModelManager."""
     global _PRIMARY_TTS
+
+    # First check if ModelManager has a model loaded
+    current_model = _model_manager.get_current_model()
+    if current_model is not None:
+        _PRIMARY_TTS = current_model
+        return current_model
+
+    # Load default models on first access
     if _PRIMARY_TTS is None:
-        # Load default models on first access
         default_gpt = os.path.join(cmd_args.model_dir, "gpt.pth")
         default_bpe = os.path.join(cmd_args.model_dir, "bpe.model")
         if os.path.exists(default_gpt) and os.path.exists(default_bpe):
             _PRIMARY_TTS = load_primary_tts(default_gpt, default_bpe)
+
     return _PRIMARY_TTS
 
 
