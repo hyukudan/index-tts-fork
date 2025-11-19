@@ -129,6 +129,26 @@ python -c "from indextts.infer_v2_modded import IndexTTS2; \
 python webui.py --model-dir models
 ```
 
+## 📊 Monitor Training Progress
+
+### Via WebUI (Recommended)
+```
+1. Go to "Training Monitor" tab in WebUI
+2. Select your project from dropdown
+3. Click "Start TensorBoard"
+4. View embedded TensorBoard + live plots
+5. Auto-refresh metrics every 10s (optional)
+```
+
+### Via Terminal (Alternative)
+```bash
+# TensorBoard
+tensorboard --logdir training/${LANG}/checkpoints/runs
+
+# Live logs
+tail -f training/${LANG}/checkpoints/training.log
+```
+
 ## 📚 Full Documentation
 
 - Complete guide: `docs/TRAINING_GUIDE.md`
