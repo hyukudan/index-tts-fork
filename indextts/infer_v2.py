@@ -657,10 +657,10 @@ class IndexTTS2:
 
                 # Normalize audio to prevent clipping if peak > 1.0
                 peak = wav.abs().max()
+                print(f">> BigVGAN output peak: {peak:.4f}")
                 if peak > 1.0:
                     wav = wav / peak  # Normalize to [-1, 1]
-                    if verbose:
-                        print(f">> Normalized audio: peak was {peak:.4f}, now 1.0")
+                    print(f">> Normalized audio: peak was {peak:.4f}, reduced to 1.0")
 
                 wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
                 if verbose:
