@@ -683,6 +683,7 @@ class IndexTTS2:
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
               duration_seconds=None,
+              output_volume=1.0,
               verbose=False, max_text_tokens_per_sentence=120, **generation_kwargs):
         """
         Main inference method for text-to-speech generation.
@@ -705,6 +706,7 @@ class IndexTTS2:
             use_random: Use random emotion selection
             interval_silence: Silence between sentences (ms)
             duration_seconds: Target duration (optional)
+            output_volume: Volume multiplier applied after normalization (0.5-2.0, default 1.0)
             verbose: Enable debug output
             max_text_tokens_per_sentence: Max tokens per sentence segment
             **generation_kwargs: Additional generation parameters
@@ -1113,6 +1115,13 @@ class IndexTTS2:
         wav = torch.tanh(wav / limiter_threshold) * limiter_threshold
         final_peak = wav.abs().max().item()
         print(f"   • After soft limiter: peak={final_peak:.4f}")
+
+        # 4. Apply user-requested output volume adjustment
+        if output_volume != 1.0:
+            wav = wav * output_volume
+            adjusted_peak = wav.abs().max().item()
+            print(f"   • Output volume multiplier: {output_volume:.2f}")
+            print(f"   • After volume adjustment: peak={adjusted_peak:.4f}")
 
         wav_length = wav.shape[-1] / sampling_rate
 

@@ -602,6 +602,99 @@ class GPUConfig:
         print("="*70 + "\n")
 
 
+def suggest_batch_size(device_id: int = 0) -> Tuple[int, str]:
+    """
+    Suggest optimal batch size based on GPU VRAM.
+
+    Args:
+        device_id: GPU device ID (0-based)
+
+    Returns:
+        Tuple of (suggested_batch_size, explanation_message)
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return 2, "CUDA not available, using conservative batch size"
+
+    if device_id >= torch.cuda.device_count():
+        return 4, "GPU not found, using default batch size"
+
+    try:
+        props = torch.cuda.get_device_properties(device_id)
+        vram_gb = props.total_memory / 1e9
+        gpu_name = torch.cuda.get_device_name(device_id)
+
+        # Conservative batch size recommendations based on VRAM
+        # These account for model size, optimizer states, and gradients
+        if vram_gb >= 40:
+            # A100 80GB, H100, etc.
+            batch_size = 16
+            reason = f"Large VRAM ({vram_gb:.0f}GB): can handle large batches for faster training"
+        elif vram_gb >= 20:
+            # RTX 4090 (24GB), A100 40GB, RTX 3090/4080
+            batch_size = 8
+            reason = f"High VRAM ({vram_gb:.0f}GB): good for medium-large batches"
+        elif vram_gb >= 12:
+            # RTX 3080/4070Ti (12-16GB)
+            batch_size = 4
+            reason = f"Medium VRAM ({vram_gb:.0f}GB): balanced batch size"
+        elif vram_gb >= 8:
+            # RTX 3060Ti, 3070 (8-10GB)
+            batch_size = 2
+            reason = f"Lower VRAM ({vram_gb:.0f}GB): conservative batch size to avoid OOM"
+        else:
+            # <8GB
+            batch_size = 1
+            reason = f"Limited VRAM ({vram_gb:.0f}GB): small batch size required"
+
+        return batch_size, reason
+
+    except Exception as e:
+        return 4, f"Unable to detect GPU VRAM ({e}), using default"
+
+
+def should_use_amp(device_id: int = 0) -> Tuple[bool, str]:
+    """
+    Determine if AMP (Automatic Mixed Precision) should be enabled for a GPU.
+
+    AMP provides significant speedup and memory savings on GPUs with Tensor Cores
+    (Volta/sm_7.0 and newer), but may be slower on older GPUs without Tensor Cores.
+
+    Args:
+        device_id: GPU device ID (0-based)
+
+    Returns:
+        Tuple of (should_enable, reason_message)
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return False, "CUDA not available"
+
+    if device_id >= torch.cuda.device_count():
+        return True, "GPU not found, defaulting to enabled"
+
+    try:
+        compute_cap = torch.cuda.get_device_capability(device_id)
+        settings = GPUConfig.get_optimal_settings(compute_cap)
+        gpu_name = torch.cuda.get_device_name(device_id)
+        arch = settings.get("architecture", "Unknown")
+
+        # Tensor Cores are available on Volta (sm_7.0) and newer
+        has_tensor_cores = settings.get("tensor_cores_available", False)
+
+        if has_tensor_cores:
+            # Recommended for modern GPUs (Volta, Turing, Ampere, Ada, Hopper, Blackwell)
+            return True, f"✓ Recommended for {arch} ({gpu_name}): 2x faster, ~40% less VRAM, minimal quality impact"
+        else:
+            # Not recommended for older GPUs (Pascal, Maxwell, etc.)
+            return False, f"✗ Not recommended for {arch} ({gpu_name}): older GPU without Tensor Cores. Enable only if you have limited VRAM."
+    except Exception as e:
+        # On error, default to enabled (safe choice)
+        return True, f"Unable to detect GPU capabilities ({e}), defaulting to enabled"
+
+
 def setup_gpu(cmd_gpu_id: Optional[int] = None) -> Tuple[Optional[int], Dict]:
     """
     Setup GPU configuration. Call this at application startup.

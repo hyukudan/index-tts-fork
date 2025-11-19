@@ -66,7 +66,7 @@ i18n = I18nAuto(language="Auto")
 MODE = 'local'
 
 # Import GPU configuration system and utilities
-from indextts.utils.gpu_config import setup_gpu, GPUConfig
+from indextts.utils.gpu_config import setup_gpu, GPUConfig, should_use_amp, suggest_batch_size
 from indextts.utils.resource_monitor import get_monitor, format_vram_bar
 from indextts.utils.model_metadata import get_gpt_info, get_tokenizer_info
 from indextts.utils.audio_history import get_history_manager
@@ -432,6 +432,7 @@ def gen_single(emo_control_method,prompt, text,
                emo_text,emo_random,
                max_text_tokens_per_sentence=120,
                target_duration=0,
+               output_volume=1.0,
                 *args, progress=gr.Progress()):
     output_path = None
     if not output_path:
@@ -487,6 +488,7 @@ def gen_single(emo_control_method,prompt, text,
                            emo_vector=vec,
                            use_emo_text=(emo_control_method==3), emo_text=emo_text,use_random=emo_random,
                            duration_seconds=duration_seconds,
+                           output_volume=output_volume,
                            verbose=cmd_args.verbose,
                            max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
                            **kwargs)
@@ -682,6 +684,16 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
     with gr.Group(visible=False) as emo_text_group:
         with gr.Row():
             emo_text = gr.Textbox(label="Emotion Description", placeholder="Describe the target emotion", value="", info="e.g., happy, angry, sad")
+
+    with gr.Row():
+        output_volume = gr.Slider(
+            label="Output Volume",
+            minimum=0.5,
+            maximum=2.0,
+            value=1.0,
+            step=0.05,
+            info="Adjust the output audio volume (1.0 = default, higher = louder)"
+        )
 
     with gr.Accordion("Advanced Generation Settings", open=False):
         with gr.Row():
@@ -992,8 +1004,22 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                 )
 
             # Model training
-            with gr.Accordion("Step 2: Fine-tune Model", open=False):
-                gr.Markdown("Fine-tune the GPT model on your language")
+            with gr.Accordion("Step 2: Train Model", open=False):
+                gr.Markdown("""
+                Train the GPT model on your language. You can either fine-tune from an existing checkpoint or train from scratch.
+
+                **Note:** Vocabulary size is automatically adjusted - if your tokenizer has a different vocab size,
+                the model will expand/shrink automatically, copying existing embeddings and initializing new ones randomly.
+                """)
+
+                # Training mode selector
+                with gr.Row():
+                    train_mode = gr.Radio(
+                        choices=["Fine-tune from checkpoint", "Train from scratch"],
+                        value="Fine-tune from checkpoint",
+                        label="Training Mode",
+                        info="Fine-tuning is faster and requires less data. From scratch is for completely new languages/domains."
+                    )
 
                 with gr.Row():
                     with gr.Column():
@@ -1001,12 +1027,12 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                             choices=[Path(p).name for p in gpt_checkpoints],
                             value=Path(gpt_checkpoints[0]).name if gpt_checkpoints else None,
                             label="Base Checkpoint",
-                            info="Starting point for fine-tuning"
+                            info="Starting point for fine-tuning (only used if fine-tuning mode is selected)"
                         )
 
                     with gr.Column():
                         train_gpu_id = gr.Dropdown(
-                            choices=[(f"GPU {i}", i) for i in range(torch.cuda.device_count())],
+                            choices=[(f"GPU {i}: {torch.cuda.get_device_name(i)}", i) for i in range(torch.cuda.device_count())],
                             value=0,
                             label="Training GPU",
                             info="GPU to use for training"
@@ -1014,11 +1040,14 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 
                 with gr.Row():
                     with gr.Column():
+                        # Set batch size based on GPU 0 VRAM
+                        default_batch_size, batch_size_reason = suggest_batch_size(0)
+
                         train_batch_size = gr.Number(
                             label="Batch Size",
-                            value=4,
+                            value=default_batch_size,
                             precision=0,
-                            info="Reduce if you get OOM errors"
+                            info=batch_size_reason
                         )
                         train_epochs = gr.Number(
                             label="Epochs",
@@ -1041,10 +1070,13 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                         )
 
                 with gr.Row():
+                    # Set AMP default based on default GPU (GPU 0)
+                    default_amp_enabled, default_amp_info = should_use_amp(0)
+
                     train_use_amp = gr.Checkbox(
                         label="Use Mixed Precision (AMP)",
-                        value=True,
-                        info="Faster training with FP16"
+                        value=default_amp_enabled,
+                        info=default_amp_info
                     )
 
                 with gr.Row():
@@ -1571,6 +1603,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 
     def handle_train_model(
         project_name,
+        train_mode,
         train_manifest,
         val_manifest,
         base_checkpoint,
@@ -1601,10 +1634,18 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             gr.Warning(f"Tokenizer not found at {tokenizer_path}. Train tokenizer first!")
             return f"❌ Tokenizer not found: {tokenizer_path}", gr.update(visible=False)
 
-        base_ckpt_path = next((p for p in gpt_paths if Path(p).name == base_checkpoint), None)
-        if not base_ckpt_path:
-            gr.Warning(f"Base checkpoint not found: {base_checkpoint}")
-            return "❌ Base checkpoint not found", gr.update(visible=False)
+        # Determine if we're fine-tuning or training from scratch
+        is_finetune = train_mode == "Fine-tune from checkpoint"
+
+        if is_finetune:
+            base_ckpt_path = next((p for p in gpt_paths if Path(p).name == base_checkpoint), None)
+            if not base_ckpt_path:
+                gr.Warning(f"Base checkpoint not found: {base_checkpoint}")
+                return "❌ Base checkpoint not found", gr.update(visible=False)
+        else:
+            # Training from scratch - use a minimal init checkpoint if needed
+            # The trainer will handle random initialization for new tokens
+            base_ckpt_path = gpt_paths[0] if gpt_paths else "checkpoints/gpt.pth"
 
         output_dir = Path(f"training/{name}/checkpoints")
 
@@ -1630,11 +1671,17 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
+            # Get GPU name for status message
+            gpu_name = torch.cuda.get_device_name(gpu_id) if torch.cuda.is_available() else f"GPU {gpu_id}"
+
             status_msg = f"🚀 **Training started for '{name}'**\n\n"
             status_msg += f"📊 Configuration:\n"
-            status_msg += f"- Base: {base_checkpoint}\n"
+            if is_finetune:
+                status_msg += f"- Mode: Fine-tuning from {base_checkpoint}\n"
+            else:
+                status_msg += f"- Mode: Training from scratch (vocab expansion enabled)\n"
             status_msg += f"- Tokenizer: {tokenizer_path.name}\n"
-            status_msg += f"- GPU: {gpu_id}\n"
+            status_msg += f"- GPU: {gpu_name}\n"
             status_msg += f"- Batch size: {int(batch_size)}\n"
             status_msg += f"- Epochs: {int(epochs)}\n"
             status_msg += f"- Learning rate: {learning_rate}\n"
@@ -2699,6 +2746,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                              emo_text,emo_random,
                              max_text_tokens_per_sentence,
                              target_duration,
+                             output_volume,
                              *advanced_params,
                      ],
                      outputs=[output_audio])
@@ -2874,10 +2922,27 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         outputs=[train_tokenizer_status, train_tokenizer_output]
     )
 
+    # Update AMP and Batch Size when GPU selection changes
+    def update_gpu_dependent_settings(gpu_id):
+        """Update AMP checkbox and batch size based on selected GPU."""
+        amp_enabled, amp_info = should_use_amp(gpu_id)
+        batch_size, batch_info = suggest_batch_size(gpu_id)
+        return (
+            gr.Checkbox(value=amp_enabled, info=amp_info),
+            gr.Number(value=batch_size, info=batch_info)
+        )
+
+    train_gpu_id.change(
+        update_gpu_dependent_settings,
+        inputs=[train_gpu_id],
+        outputs=[train_use_amp, train_batch_size]
+    )
+
     train_model_button.click(
         handle_train_model,
         inputs=[
             train_project_name,
+            train_mode,
             train_manifest,
             train_val_manifest,
             train_base_checkpoint,
