@@ -160,7 +160,8 @@ def estimate_duration(
     chars_per_second = rates.get(speech_rate, rates["normal"])
 
     # Count characters (excluding whitespace and punctuation)
-    text_chars = re.sub(r'[\s\p{P}]', '', text)
+    # Keep only alphanumeric and CJK characters
+    text_chars = re.sub(r'[^\w\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]', '', text, flags=re.UNICODE)
     char_count = len(text_chars)
 
     # Count words
