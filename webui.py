@@ -114,6 +114,11 @@ if gpu_info.get('is_blackwell'):
 _PRIMARY_TTS = None
 _MODEL_SELECTION = {"gpt": None, "bpe": None}
 _gpu_config_manager = GPUConfig()
+
+# Cache GPU choices for UI (to avoid calling get_gpu_info() again after models are loaded)
+# This must be after _gpu_config_manager is defined
+_CACHED_GPU_CHOICES = [(f"GPU {g['id']}: {g['name']} ({g['total_memory_gb']:.1f} GB)", g['id'])
+                       for g in _gpu_config_manager.get_gpu_info()]
 _current_gpu_id = gpu_id
 
 # Initialize ModelManager for hot-swap functionality
@@ -236,13 +241,14 @@ def get_tts():
 
 
 # Initialize with default models
-tts = get_tts()
+# Models are loaded on-demand when user clicks "Load Model" button
+# to avoid CUDA deadlock during Gradio UI construction
+tts = None
 
 
 def get_available_gpus():
-    """Get list of available GPUs."""
-    gpus = _gpu_config_manager.detect_gpus()
-    return [(f"GPU {gpu['id']}: {gpu['name']} ({gpu['memory_gb']:.1f} GB)", gpu['id']) for gpu in gpus]
+    """Get list of available GPUs (uses cached results to avoid CUDA deadlock)."""
+    return _CACHED_GPU_CHOICES
 
 
 def get_gpu_monitor_text():
@@ -367,15 +373,8 @@ def get_model_info_display(gpt_path):
 
 
 def get_gpu_selector_choices():
-    """Get GPU choices for selector."""
-    gpus = _gpu_config_manager.get_gpu_info()
-    choices = []
-
-    for gpu in gpus:
-        label = f"GPU {gpu['id']}: {gpu['name']} ({gpu['total_memory_gb']:.1f} GB)"
-        choices.append((label, gpu['id']))
-
-    return choices
+    """Get GPU choices for selector (uses cached results to avoid CUDA deadlock)."""
+    return _CACHED_GPU_CHOICES
 
 
 # 支持的语言列表
@@ -692,7 +691,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                 with gr.Row():
                     repetition_penalty = gr.Number(label="repetition_penalty", precision=None, value=10.0, minimum=0.1, maximum=20.0, step=0.1)
                     length_penalty = gr.Number(label="length_penalty", precision=None, value=0.0, minimum=-2.0, maximum=2.0, step=0.1)
-                max_mel_tokens = gr.Slider(label="max_mel_tokens", value=1500, minimum=50, maximum=tts.cfg.gpt.max_mel_tokens, step=10, info="Maximum generated mel tokens")
+                max_mel_tokens = gr.Slider(label="max_mel_tokens", value=1500, minimum=50, maximum=tts.cfg.gpt.max_mel_tokens if tts else 8000, step=10, info="Maximum generated mel tokens")
             with gr.Column(scale=2):
                 gr.Markdown("**Sentence Settings** _Controls sentence splitting._")
                 with gr.Row():
@@ -700,7 +699,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                         label="Max tokens per sentence",
                         value=120,
                         minimum=20,
-                        maximum=tts.cfg.gpt.max_text_tokens,
+                        maximum=tts.cfg.gpt.max_text_tokens if tts else 400,
                         step=2,
                         key="max_text_tokens_per_sentence",
                         info="Higher values mean longer sentences; adjust between 80-200",
@@ -722,7 +721,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                 prompt_audio = gr.Audio(label="Prompt Audio", key="prompt_audio",
                                         sources=["upload", "microphone"], type="filepath")
                 with gr.Column():
-                    input_text_single = gr.TextArea(label="Text", key="input_text_single", placeholder="Enter text to synthesize", info=f"Model version {tts.model_version or '1.0'}")
+                    input_text_single = gr.TextArea(label="Text", key="input_text_single", placeholder="Enter text to synthesize", info=f"Model version {tts.model_version if tts and hasattr(tts, 'model_version') else '1.0'}")
 
                     # Duration estimation and control
                     with gr.Row():
