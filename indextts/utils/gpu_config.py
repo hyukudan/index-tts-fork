@@ -207,7 +207,7 @@ class GPUConfig:
             settings.update({
                 "architecture": "Blackwell",
                 "use_bf16": True,
-                "use_tf32": True,
+                "use_tf32": False,  # Disabled for audio quality
                 "enable_flash_attn": True,
                 "recommended_dtype": "bfloat16",
                 "tensor_cores_available": True,
@@ -223,7 +223,7 @@ class GPUConfig:
             settings.update({
                 "architecture": "Hopper",
                 "use_bf16": True,
-                "use_tf32": True,
+                "use_tf32": False,  # Disabled for audio quality
                 "enable_flash_attn": True,
                 "recommended_dtype": "bfloat16",
                 "tensor_cores_available": True,
@@ -239,7 +239,7 @@ class GPUConfig:
                 "architecture": "Ada Lovelace",
                 "use_bf16": True,
                 "use_fp16": True,
-                "use_tf32": True,
+                "use_tf32": False,  # Disabled for audio quality
                 "enable_flash_attn": True,
                 "recommended_dtype": "bfloat16",
                 "tensor_cores_available": True,
@@ -255,7 +255,7 @@ class GPUConfig:
                 "architecture": "Ampere",
                 "use_bf16": True,
                 "use_fp16": True,
-                "use_tf32": True,
+                "use_tf32": False,  # Disabled for audio quality
                 "enable_flash_attn": True,
                 "recommended_dtype": "bfloat16" if minor >= 0 else "float16",
                 "tensor_cores_available": True,
