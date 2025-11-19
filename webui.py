@@ -1244,12 +1244,12 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 
         if not model_label or not gpt_paths_mapping:
             gr.Warning("Select a model first.")
-            return "⚠️ No model selected"
+            return "⚠️ No model selected", get_model_status_text(), get_gpu_monitor_text()
 
         gpt_path = gpt_paths_mapping.get(model_label)
         if not gpt_path:
             gr.Warning("Invalid model selection.")
-            return "⚠️ Invalid selection"
+            return "⚠️ Invalid selection", get_model_status_text(), get_gpu_monitor_text()
 
         try:
             # Update GPU selection
@@ -1273,11 +1273,15 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             tokenizer_name = Path(metadata.tokenizer_path).name if metadata.tokenizer_path else "None"
 
             gr.Info(f"Model loaded successfully on GPU {gpu_id}!")
-            return f"✅ Loaded: **{metadata.filename}** on GPU {gpu_id} | Tokenizer: **{tokenizer_name}**"
+            return (
+                f"✅ Loaded: **{metadata.filename}** on GPU {gpu_id} | Tokenizer: **{tokenizer_name}**",
+                get_model_status_text(),
+                get_gpu_monitor_text()
+            )
         except Exception as e:
             logger.exception("Failed to load model")
             gr.Warning(f"Failed to load model: {e}")
-            return f"❌ Load failed: {e}"
+            return f"❌ Load failed: {e}", get_model_status_text(), get_gpu_monitor_text()
 
     def refresh_monitor():
         """Refresh GPU monitor."""
@@ -2760,7 +2764,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
     load_models_button.click(
         handle_model_load,
         inputs=[gpt_dropdown, gpu_dropdown, gpt_paths_state],
-        outputs=model_status
+        outputs=[model_status, model_status_display, gpu_monitor_display]
     )
 
     # Unload model button
