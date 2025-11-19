@@ -345,6 +345,8 @@ class ModelManager:
         start_time = time.time()
 
         # Load model
+        # NOTE: infer_v2.py automatically loads GPT checkpoint and BPE model from config.yaml
+        # It does not accept gpt_checkpoint_path or bpe_model_path parameters
         try:
             model = IndexTTS2(
                 cfg_path=config_path or os.path.join(model_dir, "config.yaml"),
@@ -352,8 +354,6 @@ class ModelManager:
                 use_fp16=use_fp16,
                 device=device,
                 use_cuda_kernel=use_cuda_kernel,
-                gpt_checkpoint_path=gpt_path,
-                bpe_model_path=tokenizer_path,
                 **kwargs
             )
 
