@@ -33,14 +33,14 @@ EMOTION_PRESETS = {
         display_name="Happy & Upbeat",
         emoji="😊",
         description="Joyful and positive",
-        vector=[1.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.6, 0.0]  # High happiness, some surprise, medium arousal
+        vector=[0.833, 0.0, 0.0, 0.167, 0.0, 0.0, 0.5, 0.0]  # High happiness, some surprise, medium arousal (scaled to ≤1.5)
     ),
     "excited": EmotionPreset(
         name="excited",
         display_name="Excited & Energetic",
         emoji="🎉",
         description="High energy and enthusiasm",
-        vector=[0.8, 0.0, 0.0, 0.6, 0.0, 0.0, 1.0, 0.0]  # High arousal, happiness, surprise
+        vector=[0.5, 0.0, 0.0, 0.375, 0.0, 0.0, 0.625, 0.0]  # High arousal, happiness, surprise (scaled to ≤1.5)
     ),
     "sad": EmotionPreset(
         name="sad",
@@ -54,14 +54,14 @@ EMOTION_PRESETS = {
         display_name="Angry & Intense",
         emoji="😠",
         description="Frustrated or irritated",
-        vector=[0.0, 1.0, 0.0, 0.0, 0.3, 0.0, 0.8, 0.0]  # High anger, some disgust, high arousal
+        vector=[0.0, 0.714, 0.0, 0.0, 0.214, 0.0, 0.571, 0.0]  # High anger, some disgust, high arousal (scaled to ≤1.5)
     ),
     "fearful": EmotionPreset(
         name="fearful",
         display_name="Fearful & Anxious",
         emoji="😰",
         description="Worried or scared",
-        vector=[0.0, 0.0, 0.2, 0.3, 0.0, 0.9, 0.6, 0.0]  # High fear, some surprise, medium arousal
+        vector=[0.0, 0.0, 0.15, 0.225, 0.0, 0.675, 0.45, 0.0]  # High fear, some surprise, medium arousal (scaled to ≤1.5)
     ),
     "calm": EmotionPreset(
         name="calm",
@@ -75,14 +75,14 @@ EMOTION_PRESETS = {
         display_name="Surprised & Amazed",
         emoji="😲",
         description="Astonished or shocked",
-        vector=[0.3, 0.0, 0.0, 1.0, 0.0, 0.1, 0.7, 0.0]  # High surprise, medium arousal
+        vector=[0.214, 0.0, 0.0, 0.714, 0.0, 0.071, 0.5, 0.0]  # High surprise, medium arousal (scaled to ≤1.5)
     ),
     "disgusted": EmotionPreset(
         name="disgusted",
         display_name="Disgusted & Repulsed",
         emoji="🤢",
         description="Feeling revulsion",
-        vector=[0.0, 0.3, 0.0, 0.0, 1.0, 0.0, 0.4, 0.0]  # High disgust, some anger
+        vector=[0.0, 0.265, 0.0, 0.0, 0.882, 0.0, 0.353, 0.0]  # High disgust, some anger (scaled to ≤1.5)
     ),
     "confident": EmotionPreset(
         name="confident",
@@ -96,7 +96,7 @@ EMOTION_PRESETS = {
         display_name="Tender & Gentle",
         emoji="🥰",
         description="Soft and affectionate",
-        vector=[0.7, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2, 0.8]  # High happiness and calm, low arousal
+        vector=[0.618, 0.0, 0.0, 0.0, 0.0, 0.0, 0.176, 0.706]  # High happiness and calm, low arousal (scaled to ≤1.5)
     ),
 }
 

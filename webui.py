@@ -85,7 +85,8 @@ from indextts.utils.emotion_presets import (
     get_preset_choices,
     get_preset_vector,
     mix_emotions,
-    get_preset_description
+    get_preset_description,
+    normalize_vector
 )
 from indextts.utils.duration_estimator import (
     estimate_duration,
@@ -1302,6 +1303,9 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         if vector is None:
             return [gr.update()] * 8
 
+        # Normalize vector to ensure it doesn't exceed 1.5 sum
+        vector = normalize_vector(vector, max_sum=1.5)
+
         # Return updates for all 8 sliders
         return [gr.update(value=v) for v in vector]
 
@@ -1310,6 +1314,9 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         # Convert ratio from 0-100 to 0.0-1.0
         ratio_normalized = ratio / 100.0
         mixed_vector = mix_emotions(preset_a, preset_b, ratio_normalized)
+
+        # Normalize vector to ensure it doesn't exceed 1.5 sum
+        mixed_vector = normalize_vector(mixed_vector, max_sum=1.5)
 
         # Return updates for all 8 sliders
         return [gr.update(value=v) for v in mixed_vector]
