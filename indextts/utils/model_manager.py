@@ -18,7 +18,7 @@ from typing import Optional, Dict, List, Any
 import torch
 from omegaconf import OmegaConf
 
-from indextts.infer_v2_modded import IndexTTS2
+from indextts.infer_v2 import IndexTTS2
 
 
 logger = logging.getLogger(__name__)
