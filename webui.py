@@ -58,7 +58,7 @@ os.makedirs(torch_cache_dir, exist_ok=True)
 
 import gradio as gr
 from indextts import infer
-from indextts.infer_v2_modded import IndexTTS2
+from indextts.infer_v2 import IndexTTS2
 from tools.i18n.i18n import I18nAuto
 from modelscope.hub import api
 
@@ -1240,7 +1240,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 
     def handle_model_load(model_label, gpu_id, gpt_paths_mapping):
         """Load selected model with specified GPU."""
-        global _current_gpu_id
+        global _current_gpu_id, gpu_info
 
         if not model_label or not gpt_paths_mapping:
             gr.Warning("Select a model first.")
@@ -1252,8 +1252,13 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             return "⚠️ Invalid selection", get_model_status_text(), get_gpu_monitor_text()
 
         try:
-            # Update GPU selection
+            # Update GPU selection and re-detect GPU info
             _current_gpu_id = gpu_id
+            # Get fresh GPU info for the selected GPU
+            all_gpus = _gpu_config_manager.get_gpu_info()
+            if gpu_id < len(all_gpus):
+                gpu_info = all_gpus[gpu_id]
+                logger.info(f"Switched to GPU {gpu_id}: {gpu_info['name']}")
 
             # Apply architecture-specific optimizations for the selected GPU
             # This ensures TF32, cuDNN, and other settings are optimal for the target GPU
