@@ -141,12 +141,33 @@ class ModelManager:
         file_size = os.path.getsize(gpt_path) / (1024 ** 2)  # MB
         filename = os.path.basename(gpt_path)
 
-        # Auto-detect config
+        # Auto-detect config based on model name pattern
+        # For gpt_catalan.pth or gpt_catalan_24k.pth, look for config_catalan.yaml
         if config_path is None:
             model_dir = os.path.dirname(gpt_path)
-            potential_config = os.path.join(model_dir, "config.yaml")
-            if os.path.exists(potential_config):
-                config_path = potential_config
+            stem = Path(gpt_path).stem  # e.g., "gpt_catalan_24k" or "gpt_catalan"
+
+            # Extract language/variant from filename (e.g., "catalan" from "gpt_catalan_24k")
+            config_candidates = []
+            if stem.startswith('gpt_'):
+                # Remove "gpt_" prefix and any trailing numbers/suffixes
+                variant = stem[4:]  # "catalan_24k" or "catalan"
+                # Try to extract the language part (before any _number suffix)
+                parts = variant.split('_')
+                if parts:
+                    lang = parts[0]  # "catalan"
+                    config_candidates.append(f"config_{lang}.yaml")
+                    config_candidates.append(f"config_{variant}.yaml")
+
+            # Add standard fallbacks
+            config_candidates.extend([f"config_{stem}.yaml", "config.yaml"])
+
+            for cfg_name in config_candidates:
+                potential_config = os.path.join(model_dir, cfg_name)
+                if os.path.exists(potential_config):
+                    config_path = potential_config
+                    logger.info(f"Auto-detected config: {cfg_name}")
+                    break
 
         # Load checkpoint to extract architecture details
         try:
@@ -207,24 +228,57 @@ class ModelManager:
             except Exception as e:
                 logger.warning(f"Could not load config: {e}")
 
-        # Auto-detect tokenizer
+        # Auto-detect tokenizer based on model name pattern
+        # For gpt_catalan.pth, look for catalan_bpe*.model, catalan*.model, etc.
         if tokenizer_path is None:
             model_dir = os.path.dirname(gpt_path)
+            stem = Path(gpt_path).stem
 
-            # Check same directory
-            for bpe_file in ['bpe.model', 'tokenizer.model', f'{Path(gpt_path).stem}_bpe.model']:
-                candidate = os.path.join(model_dir, bpe_file)
-                if os.path.exists(candidate):
-                    tokenizer_path = candidate
-                    break
+            # Build prioritized list of tokenizer candidates
+            bpe_candidates = []
+            if stem.startswith('gpt_'):
+                variant = stem[4:]  # "catalan_24k" or "catalan"
+                parts = variant.split('_')
+                if parts:
+                    lang = parts[0]  # "catalan"
+                    # Language-specific patterns (highest priority)
+                    bpe_candidates.extend([
+                        f'{lang}_bpe*.model',  # catalan_bpe_24k.model
+                        f'{lang}*.model',      # catalan_24k.model
+                        f'bpe_{lang}*.model',  # bpe_catalan.model
+                    ])
 
-            # Check tokenizers subdirectory
+            # Generic fallbacks
+            bpe_candidates.extend([
+                f'{stem}_bpe.model',
+                'bpe.model',
+                'tokenizer.model',
+                '*.model'  # Last resort: any .model file
+            ])
+
+            # Search for tokenizer
+            for pattern in bpe_candidates:
+                if '*' in pattern:
+                    matches = list(Path(model_dir).glob(pattern))
+                    if matches:
+                        tokenizer_path = str(matches[0])
+                        logger.info(f"Auto-detected tokenizer: {matches[0].name}")
+                        break
+                else:
+                    candidate = os.path.join(model_dir, pattern)
+                    if os.path.exists(candidate):
+                        tokenizer_path = candidate
+                        logger.info(f"Auto-detected tokenizer: {pattern}")
+                        break
+
+            # Check tokenizers subdirectory as last fallback
             if tokenizer_path is None:
                 tokenizers_dir = os.path.join(model_dir, 'tokenizers')
                 if os.path.exists(tokenizers_dir):
                     bpe_files = list(Path(tokenizers_dir).glob('*.model'))
                     if bpe_files:
                         tokenizer_path = str(bpe_files[0])
+                        logger.info(f"Auto-detected tokenizer from subdirectory: {bpe_files[0].name}")
 
         # Estimate VRAM requirements
         # Base model size + embeddings + working memory

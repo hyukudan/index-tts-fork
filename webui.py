@@ -199,7 +199,7 @@ def load_primary_tts(gpt_path, bpe_path=None):
             gpu_id=_current_gpu_id,
             use_fp16=cmd_args.is_fp16,
             use_cuda_kernel=False,
-            config_path=os.path.join(cmd_args.model_dir, "config.yaml"),
+            config_path=None,  # Auto-detect config based on model name (e.g., gpt_catalan.pth -> config_catalan.yaml)
             tokenizer_path=resolved_bpe  # None triggers auto-detection
         )
 
