@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-Generic preprocessing pipeline for IndexTTS2 datasets.
+Preprocess Catalan Arrow datasets (lafrescat/festcat) for IndexTTS2 fine-tuning.
 
-This script mirrors `tools/preprocess_japanese.py`, but exposes a configurable
-`--language` flag so we can target different SentencePiece models / normaliser
-settings without duplicating the implementation for each locale.
+This script reads HuggingFace Arrow datasets and performs the complete IndexTTS preprocessing:
+  1. Extract audio from Arrow format
+  2. Text normalization and tokenization (Catalan)
+  3. Semantic feature extraction via SeamlessM4T + Wav2Vec2Bert
+  4. Semantic code quantization with MaskGCT semantic codec
+  5. Conditioning latent + emotion vector extraction with UnifiedVoice v2
+  6. Generate train/validation JSONL manifests
 
-Workflow recap:
-  1. Normalise and tokenize text with the provided SentencePiece model.
-  2. Load audio, extract semantic features with SeamlessM4T + Wav2Vec2Bert.
-  3. Quantise semantic codes using the MaskGCT semantic codec.
-  4. Extract conditioning latents & emotion vectors from the UnifiedVoice GPT.
-  5. Persist `.npy` artefacts and write train/validation JSONL manifests.
+Usage:
+    python tools/preprocess_catalan.py \\
+        --dataset ca=/home/sergioc/projects/datasets/catalan/lafrescat \\
+        --dataset ca=/home/sergioc/projects/datasets/catalan/festcat \\
+        --output-root processed_catalan \\
+        --tokenizer checkpoints/bpe.model \\
+        --device cuda
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ import os
 import random
 import re
 import hashlib
+import io
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -38,6 +44,12 @@ from indextts.utils.front import TextNormalizer, TextTokenizer
 from indextts.utils.maskgct_utils import build_semantic_codec, build_semantic_model
 from huggingface_hub import hf_hub_download
 import safetensors.torch
+
+try:
+    from datasets import load_from_disk, Audio
+    DATASETS_AVAILABLE = True
+except ImportError:
+    DATASETS_AVAILABLE = False
 
 
 def load_existing_ids(manifest_path: Path) -> set[str]:
@@ -84,41 +96,29 @@ def assign_to_validation(sample_id: str, ratio: float) -> bool:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Preprocess dataset for IndexTTS2 fine-tuning."
-    )
-    parser.add_argument(
-        "--manifest",
-        type=Path,
-        default=Path("JA_yodas_dataset/ja_yodas_train.jsonl"),
-        help="Source manifest (JSONL) with fields id/text/audio/speaker/language.",
+        description="Preprocess Catalan Arrow datasets for IndexTTS2 fine-tuning."
     )
     parser.add_argument(
         "--dataset",
         action="append",
-        metavar="LANG=MANIFEST[=OUTPUT]",
+        metavar="LANG=DATASET_PATH[=OUTPUT]",
         help=(
-            "Additional dataset to process. Provide entries like "
-            "`ja=datasets/JA_yodas_dataset/ja_yodas_train.jsonl` or "
-            "`ja=datasets/JA_yodas_dataset/ja_yodas_train.jsonl=ja_processed_data`."
+            "Arrow dataset to process. Provide entries like "
+            "`ca=/path/to/lafrescat` or "
+            "`ca=/path/to/lafrescat=lafrescat_processed`. "
             "Can be supplied multiple times."
         ),
     )
     parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("processed_data"),
-        help="Directory to store processed artifacts.",
-    )
-    parser.add_argument(
         "--output-root",
         type=Path,
-        default=None,
-        help="Base directory for outputs when using --dataset entries (default: current directory).",
+        default=Path("processed_catalan"),
+        help="Base directory for outputs.",
     )
     parser.add_argument(
         "--tokenizer",
         type=Path,
-        default=Path("checkpoints/japanese_bpe.model"),
+        default=Path("checkpoints/bpe.model"),
         help="Path to the trained SentencePiece model.",
     )
     parser.add_argument(
@@ -134,12 +134,6 @@ def parse_args() -> argparse.Namespace:
         help="Base UnifiedVoice checkpoint for conditioning extraction.",
     )
     parser.add_argument(
-        "--language",
-        type=str,
-        default="ja",
-        help="Language hint passed to the TextNormalizer/TextTokenizer.",
-    )
-    parser.add_argument(
         "--device",
         default="cuda",
         help="Computation device (cuda or cpu).",
@@ -147,8 +141,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--val-ratio",
         type=float,
-        default=0.01,
-        help="Fraction of data reserved for validation.",
+        default=0.05,
+        help="Fraction of data reserved for validation (default: 5%).",
     )
     parser.add_argument(
         "--seed",
@@ -163,27 +157,21 @@ def parse_args() -> argparse.Namespace:
         help="Limit samples for debugging (0 means process all).",
     )
     parser.add_argument(
-        "--audio-sr",
-        type=int,
-        default=24000,
-        help="Target sampling rate for cached waveform if stored (kept for completeness).",
-    )
-    parser.add_argument(
         "--skip-existing",
         action="store_true",
-        help="Skip samples whose feature files already exist in output_dir.",
+        help="Skip samples whose feature files already exist.",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=1,
-        help="Number of samples to process concurrently. Increase for higher throughput if VRAM allows.",
+        default=4,
+        help="Number of samples to process concurrently.",
     )
     parser.add_argument(
         "--workers",
         type=int,
-        default=0,
-        help="Number of background worker threads for audio loading/resampling. 0 disables threading.",
+        default=2,
+        help="Number of background worker threads for audio loading.",
     )
     return parser.parse_args()
 
@@ -199,13 +187,24 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-def load_audio(path: Path, target_sr: int) -> Tuple[torch.Tensor, int]:
-    wav, sr = torchaudio.load(path)
+def load_audio_from_array(audio_array: np.ndarray, sr: int, target_sr: int) -> Tuple[torch.Tensor, int]:
+    """Load audio from numpy array (from Arrow dataset)."""
+    # Convert to torch tensor
+    wav = torch.from_numpy(audio_array).float()
+
+    # Ensure it's 2D (channels, samples)
+    if wav.dim() == 1:
+        wav = wav.unsqueeze(0)
+
+    # Convert to mono if needed
     if wav.size(0) > 1:
         wav = wav.mean(dim=0, keepdim=True)
+
+    # Resample if needed
     if sr != target_sr:
         wav = torchaudio.functional.resample(wav, sr, target_sr)
         sr = target_sr
+
     return wav, sr
 
 
@@ -286,40 +285,6 @@ def save_numpy(path: Path, array: np.ndarray) -> None:
     np.save(path, array)
 
 
-def resolve_audio_path(audio_value: str, audio_roots: Iterable[Path]) -> Path | None:
-    path = Path(audio_value).expanduser()
-    if path.is_file():
-        return path
-
-    audio_rel = Path(audio_value)
-    for root in audio_roots:
-        candidate = (root / audio_rel).expanduser()
-        if candidate.is_file():
-            return candidate
-    return None
-
-
-def format_audio_reference(audio_value: str, resolved_path: Path, audio_roots: Iterable[Path]) -> str:
-    value = (audio_value or "").strip()
-    if value:
-        # Convert backslashes to forward slashes and drop any leading './'
-        cleaned = Path(value).as_posix().lstrip("./")
-        if cleaned:
-            return cleaned
-
-    resolved_path = resolved_path.resolve()
-    for root in audio_roots:
-        try:
-            rel = resolved_path.relative_to(root.resolve())
-            cleaned = rel.as_posix().lstrip("./")
-            if cleaned:
-                return cleaned
-        except ValueError:
-            continue
-    # Fall back to filename only as a last resort
-    return resolved_path.name
-
-
 def process_batch(
     samples: Sequence[Dict[str, Any]],
     tokenizer: TextTokenizer,
@@ -327,66 +292,57 @@ def process_batch(
     semantic_extractor: SemanticExtractor,
     gpt: UnifiedVoice,
     dirs: Dict[str, Path],
-    audio_roots: Iterable[Path],
     executor: ThreadPoolExecutor | None,
-    target_sr: int = 24000,
 ) -> Tuple[List[Dict[str, Any]], int]:
     prepared: List[Dict[str, Any]] = []
     skipped = 0
 
     candidates: List[Dict[str, Any]] = []
     for sample in samples:
-        audio_field = sample.get("audio", "")
-        audio_path = resolve_audio_path(audio_field, audio_roots)
-        if audio_path is None:
-            skipped += 1
-            continue
-        audio_reference = format_audio_reference(audio_field, audio_path, audio_roots)
+        # Extract text from 'transcription' field (Arrow format)
+        text = clean_text(sample.get("transcription", sample.get("text", "")))
 
-        text = clean_text(sample.get("text", ""))
-        text_tokens = tokenizer.tokenize(text)
+        # Tokenize for Catalan (using ca language hint)
+        text_tokens = tokenizer.tokenize(text, language="ca")
         if not text_tokens:
             skipped += 1
             continue
         text_ids = np.asarray(tokenizer.convert_tokens_to_ids(text_tokens), dtype=np.int32)
 
+        # Audio is embedded in Arrow format
+        audio_data = sample.get("audio")
+        if audio_data is None:
+            skipped += 1
+            continue
+
         candidates.append(
             {
                 "sample": sample,
-                "audio_reference": audio_reference,
                 "text": text,
                 "text_ids": text_ids,
-                "audio_path": audio_path,
+                "audio_data": audio_data,
             }
         )
 
     if not candidates:
         return [], skipped
 
-    if executor is not None:
-        futures: Dict[Future, Dict[str, Any]] = {}
-        for item in candidates:
-            future = executor.submit(load_audio, item["audio_path"], target_sr)
-            futures[future] = item
-        for future, item in futures.items():
-            try:
-                waveform, sr = future.result()
-            except Exception:
-                skipped += 1
-                continue
+    # Load audio from Arrow format
+    for item in candidates:
+        try:
+            audio_data = item["audio_data"]
+            # Arrow audio format: dict with 'array' and 'sampling_rate'
+            audio_array = audio_data["array"]
+            sr = audio_data["sampling_rate"]
+
+            waveform, sr = load_audio_from_array(audio_array, sr, target_sr=24000)
             item["waveform"] = waveform
             item["sr"] = sr
             prepared.append(item)
-    else:
-        for item in candidates:
-            try:
-                waveform, sr = load_audio(item["audio_path"], target_sr=target_sr)
-            except Exception:
-                skipped += 1
-                continue
-            item["waveform"] = waveform
-            item["sr"] = sr
-            prepared.append(item)
+        except Exception as e:
+            print(f"Error loading audio for sample {item['sample'].get('id', 'unknown')}: {e}")
+            skipped += 1
+            continue
 
     if not prepared:
         return [], skipped
@@ -401,9 +357,9 @@ def process_batch(
             semantic_code = semantic_code.unsqueeze(0)
         semantic_code = semantic_code.detach().cpu().numpy().astype(np.int32)
         cond_lengths = attention_mask.sum(dim=1).long()
+        feat_t = feat.transpose(1, 2)
         cond_lengths_device = cond_lengths.to(feat.device)
-        # For conformer_perceiver, pass feat directly (B, T, F) without transpose
-        conditioning = gpt.get_conditioning(feat, cond_lengths_device)
+        conditioning = gpt.get_conditioning(feat_t, cond_lengths_device)
         emo_vec = gpt.get_emovec(feat, cond_lengths_device)
 
     conditioning_np = conditioning.detach().cpu().numpy().astype(np.float32)
@@ -426,11 +382,11 @@ def process_batch(
 
         entry = {
             "id": uid,
-            "audio_path": item["audio_reference"],
+            "audio_path": f"arrow://{sample.get('id', 'unknown')}",  # Placeholder since audio is embedded
             "text": item["text"],
-            "speaker": sample.get("speaker", ""),
-            "language": sample.get("language", ""),
-            "duration": sample.get("duration"),
+            "speaker": sample.get("speaker_id", "unknown"),
+            "language": "ca",
+            "duration": len(item["waveform"][0]) / item["sr"],
             "text_ids_path": text_path.relative_to(output_root).as_posix(),
             "text_len": int(item["text_ids"].size),
             "codes_path": code_path.relative_to(output_root).as_posix(),
@@ -444,41 +400,24 @@ def process_batch(
     return entries, skipped
 
 
-LANGUAGE_HINT_OVERRIDES: Dict[str, Optional[str]] = {
-    "en": "en",
-    "fr": "en",
-    "de": "en",
-    "zh": "zh",
-    "cn": "zh",
-    "ja": "ja",
-    "jp": "ja",
-}
-
-
-def language_hint_from_code(code: str, default: Optional[str] = None) -> Optional[str]:
-    return LANGUAGE_HINT_OVERRIDES.get(code.lower(), default)
-
-
-def parse_dataset_spec(spec: str, output_root: Optional[Path]) -> tuple[str, Path, Path]:
+def parse_dataset_spec(spec: str, output_root: Path) -> tuple[str, Path, Path]:
     parts = spec.split("=")
     if len(parts) < 2 or len(parts) > 3:
         raise ValueError(
-            f"Invalid --dataset entry '{spec}'. Expected format LANG=MANIFEST or LANG=MANIFEST=OUTPUT."
+            f"Invalid --dataset entry '{spec}'. Expected format LANG=DATASET_PATH or LANG=DATASET_PATH=OUTPUT."
         )
     lang = parts[0].strip()
-    manifest = Path(parts[1].strip())
+    dataset_path = Path(parts[1].strip())
     if len(parts) == 3 and parts[2].strip():
         output_dir = Path(parts[2].strip())
     else:
-        if output_root is not None:
-            output_dir = output_root / f"{lang.lower()}_processed_data"
-        else:
-            output_dir = Path(f"{lang.lower()}_processed_data")
-    return lang, manifest, output_dir
+        # Use dataset folder name for output
+        output_dir = output_root / dataset_path.name
+    return lang, dataset_path, output_dir
 
 
 def preprocess_dataset(
-    manifest_path: Path,
+    dataset_path: Path,
     output_dir: Path,
     dataset_language: str,
     normalizer_hint: Optional[str],
@@ -492,9 +431,23 @@ def preprocess_dataset(
     batch_size: int,
     executor: Optional[ThreadPoolExecutor],
 ) -> tuple[int, int, int, int]:
-    manifest_path = manifest_path.expanduser().resolve()
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+    if not DATASETS_AVAILABLE:
+        raise ImportError("datasets library not found. Install with: uv sync --extra datasets")
+
+    dataset_path = dataset_path.expanduser().resolve()
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"Dataset not found: {dataset_path}")
+
+    print(f"Loading Arrow dataset from {dataset_path}...")
+    # Load HuggingFace Arrow dataset
+    # The dataset folder should contain dataset/data-00000-of-00001.arrow
+    dataset_folder = dataset_path / "dataset"
+    if not dataset_folder.exists():
+        dataset_folder = dataset_path
+
+    dataset = load_from_disk(str(dataset_folder))
+    print(f"Loaded {len(dataset)} samples")
+
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     dirs = ensure_dirs(output_dir)
@@ -517,15 +470,6 @@ def preprocess_dataset(
     processed = 0
     skipped = 0
     pending: List[Dict[str, Any]] = []
-    audio_roots = list(
-        dict.fromkeys(
-            [
-                Path(".").resolve(),
-                manifest_path.parent.resolve(),
-                manifest_path.parent.parent.resolve(),
-            ]
-        )
-    )
 
     def flush(force: bool = False) -> None:
         nonlocal pending, processed, skipped
@@ -549,9 +493,7 @@ def preprocess_dataset(
                 semantic_extractor,
                 gpt,
                 dirs,
-                audio_roots=audio_roots,
                 executor=executor,
-                target_sr=args.audio_sr,
             )
             skipped += batch_skipped
             pending = pending[limit:]
@@ -560,10 +502,12 @@ def preprocess_dataset(
                 if is_val:
                     if entry["id"] not in val_ids:
                         val_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                        val_file.flush()
                         val_ids.add(entry["id"])
                 else:
                     if entry["id"] not in train_ids:
                         train_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                        train_file.flush()
                         train_ids.add(entry["id"])
                 processed += 1
                 if args.max_samples and processed >= args.max_samples:
@@ -571,22 +515,33 @@ def preprocess_dataset(
                     return
 
     try:
-        with open(manifest_path, "r", encoding="utf-8") as source:
-            for line in tqdm(source, desc=f"Preprocessing [{dataset_language}]", unit="sample"):
-                if args.max_samples and processed >= args.max_samples:
-                    break
-                record = json.loads(line)
-                uid = record["id"]
-                if args.skip_existing and (
-                    (output_dir / "codes" / f"{uid}.npy").exists()
-                    and (output_dir / "text_ids" / f"{uid}.npy").exists()
-                ):
-                    continue
+        # Process Arrow dataset samples
+        for idx, sample in enumerate(tqdm(dataset, desc=f"Preprocessing [{dataset_language}]", unit="sample")):
+            if args.max_samples and processed >= args.max_samples:
+                break
 
-                pending.append(record)
-                flush()
-                if args.max_samples and processed >= args.max_samples:
-                    break
+            # Generate unique ID if not present
+            if "id" not in sample:
+                sample["id"] = f"{dataset_path.name}_{idx:06d}"
+
+            uid = sample["id"]
+
+            # Skip if already processed
+            if uid in train_ids or uid in val_ids:
+                skipped += 1
+                continue
+
+            if args.skip_existing and (
+                (output_dir / "codes" / f"{uid}.npy").exists()
+                and (output_dir / "text_ids" / f"{uid}.npy").exists()
+            ):
+                skipped += 1
+                continue
+
+            pending.append(dict(sample))
+            flush()
+            if args.max_samples and processed >= args.max_samples:
+                break
         flush(force=True)
     finally:
         train_file.close()
@@ -610,21 +565,26 @@ def preprocess_dataset(
 
 def main() -> None:
     args = parse_args()
+
+    if not args.dataset:
+        raise ValueError(
+            "No datasets specified. Use --dataset ca=/path/to/dataset. "
+            "Example: --dataset ca=/home/sergioc/projects/datasets/catalan/lafrescat"
+        )
+
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     batch_size = max(1, args.batch_size)
 
-    output_root = args.output_root.expanduser().resolve() if args.output_root else None
+    output_root = args.output_root.expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
 
     dataset_specs: List[tuple[str, Path, Path]] = []
-    if args.dataset:
-        for spec in args.dataset:
-            lang, manifest, output_dir = parse_dataset_spec(spec, output_root)
-            dataset_specs.append((lang, manifest, output_dir))
-    else:
-        dataset_specs.append((args.language, args.manifest, args.output_dir))
+    for spec in args.dataset:
+        lang, dataset_path, output_dir = parse_dataset_spec(spec, output_root)
+        dataset_specs.append((lang, dataset_path, output_dir))
 
     executor: Optional[ThreadPoolExecutor] = None
     if args.workers > 0:
@@ -635,8 +595,11 @@ def main() -> None:
     stats_path = Path(stats_value or "checkpoints/wav2vec2bert_stats.pt")
     if not stats_path.is_absolute():
         stats_path = (args.config.parent / stats_path).resolve()
+
+    print("Initializing semantic extractor...")
     semantic_extractor = SemanticExtractor(stats_path, device)
 
+    print("Loading semantic codec...")
     semantic_codec = build_semantic_codec(cfg.semantic_codec)
     semantic_code_ckpt = hf_hub_download(
         "amphion/MaskGCT", filename="semantic_codec/model.safetensors"
@@ -645,15 +608,16 @@ def main() -> None:
     semantic_codec = semantic_codec.to(device)
     semantic_codec.eval()
 
+    print("Loading UnifiedVoice GPT...")
     gpt = build_unified_voice(cfg, args.gpt_checkpoint, device)
 
     summaries: List[tuple[str, int, int, int, int]] = []
     try:
-        for lang, manifest, output_dir in dataset_specs:
-            hint_default = args.language if not args.dataset else None
-            normalizer_hint = language_hint_from_code(lang, hint_default)
+        for lang, dataset_path, output_dir in dataset_specs:
+            # For Catalan, use 'ca' language hint (will fall back to 'en' in normalizer)
+            normalizer_hint = "ca" if lang.lower() == "ca" else lang.lower()
             processed, skipped, train_count, val_count = preprocess_dataset(
-                manifest,
+                dataset_path,
                 output_dir,
                 lang,
                 normalizer_hint,
@@ -667,16 +631,16 @@ def main() -> None:
                 batch_size,
                 executor,
             )
-            summaries.append((lang, processed, skipped, train_count, val_count))
+            summaries.append((dataset_path.name, processed, skipped, train_count, val_count))
     finally:
         if executor is not None:
             executor.shutdown(wait=True)
 
-    if len(summaries) > 1:
-        print("=== Summary ===")
-        for lang, processed, skipped, train_count, val_count in summaries:
+    if len(summaries) > 0:
+        print("\n=== Summary ===")
+        for name, processed, skipped, train_count, val_count in summaries:
             print(
-                f"[{lang}] processed={processed} skipped={skipped} "
+                f"[{name}] processed={processed} skipped={skipped} "
                 f"train={train_count} val={val_count}"
             )
 

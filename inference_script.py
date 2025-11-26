@@ -157,6 +157,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print verbose inference logs.",
     )
+    parser.add_argument(
+        "--output-volume",
+        type=float,
+        default=1.0,
+        help="Output volume multiplier (default: 1.0). Use values > 1.0 to increase volume.",
+    )
 
     return parser.parse_args()
 
@@ -243,6 +249,7 @@ def main() -> None:
             interval_silence=args.interval_silence,
             verbose=args.verbose,
             max_text_tokens_per_segment=args.max_text_tokens,
+            output_volume=args.output_volume,
             **generation_kwargs,
         )
         print(f"Inference complete. Output saved to {Path(args.output).resolve()}")

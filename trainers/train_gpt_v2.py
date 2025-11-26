@@ -422,8 +422,17 @@ def build_model(cfg_path: Path, tokenizer: TextTokenizer, base_checkpoint: Path,
     if cfg.gpt.number_text_tokens != vocab_size:
         cfg.gpt.number_text_tokens = vocab_size
 
+    # Override max_mel_tokens to support longer mel sequences (max 1891 in data)
+    # 2048 provides safe margin (original was 1815)
+    if cfg.gpt.max_mel_tokens < 2046:
+        print(f"[Info] Overriding max_mel_tokens from {cfg.gpt.max_mel_tokens} to 2046 for longer sequences")
+        cfg.gpt.max_mel_tokens = 2046
+
+    print(f"[Info] Creating model...")
     model = UnifiedVoice(**cfg.gpt)
+    print(f"[Info] Model created, loading checkpoint from {base_checkpoint}...")
     checkpoint = torch.load(base_checkpoint, map_location="cpu")
+    print(f"[Info] Checkpoint loaded, extracting state dict...")
     raw_state_dict = checkpoint.get("model", checkpoint)
 
     filtered_state_dict = {}
@@ -442,6 +451,7 @@ def build_model(cfg_path: Path, tokenizer: TextTokenizer, base_checkpoint: Path,
         "text_embedding.weight": model.text_embedding.weight,
         "text_head.weight": model.text_head.weight,
         "text_head.bias": model.text_head.bias,
+        "mel_pos_embedding.emb.weight": model.mel_pos_embedding.emb.weight,
     }
     for key, param in resizable_keys.items():
         weight = state_dict.pop(key, None)
@@ -614,10 +624,17 @@ def main() -> None:
         else os.environ["INDEXTTS_RUN_NAME"]
     )
     log_dir = log_root / run_name
+    print(f"[Info] Creating TensorBoard writer at {log_dir}...")
     writer = SummaryWriter(log_dir=str(log_dir))
+    print(f"[Info] TensorBoard writer created")
 
+    print(f"[Info] Loading tokenizer from {args.tokenizer}...")
     tokenizer = load_tokenizer(args.tokenizer)
+    print(f"[Info] Tokenizer loaded, vocab size: {tokenizer.vocab_size}")
+
+    print(f"[Info] Building model...")
     model = build_model(args.config, tokenizer, args.base_checkpoint, device)
+    print(f"[Info] Model built successfully")
 
     train_specs = parse_manifest_specs(args.train_manifests, "--train-manifest")
     val_specs = parse_manifest_specs(args.val_manifests, "--val-manifest")
